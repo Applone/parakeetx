@@ -1,0 +1,7 @@
+/target/
+/.crush/
+/.test-cache/
+*.partial
+__pycache__/
+.venv/
+.env

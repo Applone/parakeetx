@@ -1,0 +1,71 @@
+[package]
+name = "parakeetx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local-first recording, transcription, and speaker-aware notes"
+license = "MIT"
+
+[features]
+default = []
+cuda = ["whisper-rs/cuda", "parakeet-rs/cuda"]
+metal = ["whisper-rs/metal"]
+vulkan = ["whisper-rs/vulkan"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crossbeam-channel = "0.5"
+directories = "6"
+fs2 = "0.4"
+hound = "3.5"
+iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland", "advanced", "svg"] }
+open = "5"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-24"] }
+parakeet-rs = { version = "=0.3.8", default-features = false, features = ["cpu", "api-24"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rfd = "0.17"
+rubato = "0.16"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+symphonia = { version = "0.5", features = ["all"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+whisper-rs = "0.16"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2.30"
+keyring = { version = "3.6", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.17"
+keyring = { version = "3.6", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+cpal = "0.17"
+keyring = { version = "3.6", features = ["windows-native"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3
+
+[profile.dev.package.parakeet-rs]
+opt-level = 3
+
+[profile.dev.package.realfft]
+opt-level = 3
+
+[profile.dev.package.rustfft]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
