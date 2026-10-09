@@ -55,7 +55,9 @@ def linux_packages(stage, output, name, version, license_name):
     for library in stage.glob("*.so*"):
         shutil.copy2(library, binaries / library.name)
     documentation = filesystem / "usr/share/doc/parakeetx"
-    shutil.copytree(stage / "docs", documentation)
+    documentation.mkdir(parents=True)
+    if (stage / "docs").is_dir():
+        shutil.copytree(stage / "docs", documentation, dirs_exist_ok=True)
     shutil.copy2(stage / "LICENSE", documentation / "LICENSE")
     shutil.copytree(stage / "python", filesystem / "usr/share/parakeetx/python")
     applications = filesystem / "usr/share/applications"

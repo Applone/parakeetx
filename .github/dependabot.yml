@@ -9,11 +9,19 @@ updates:
       - "dependencies"
       - "rust"
     reviewers:
-      - "applone"
+      - "Applone"
     assignees:
-      - "applone"
+      - "Applone"
     commit-message:
       prefix: "chore(deps)"
+    # These API changes require source migrations. Compatible updates stay enabled.
+    ignore:
+      - dependency-name: "rubato"
+        versions: [">=0.17.0"]
+      - dependency-name: "symphonia"
+        versions: [">=0.6.0"]
+      - dependency-name: "cpal"
+        versions: [">=0.18.0"]
     groups:
       cargo-dependencies:
         patterns:
@@ -28,9 +36,9 @@ updates:
       - "dependencies"
       - "python"
     reviewers:
-      - "applone"
+      - "Applone"
     assignees:
-      - "applone"
+      - "Applone"
     commit-message:
       prefix: "chore(deps)"
     groups:
@@ -47,8 +55,8 @@ updates:
       - "dependencies"
       - "ci"
     reviewers:
-      - "applone"
+      - "Applone"
     assignees:
-      - "applone"
+      - "Applone"
     commit-message:
       prefix: "ci(deps)"

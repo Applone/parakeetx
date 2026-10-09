@@ -44,6 +44,13 @@ def copy_resources(destination):
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    if runtime := os.environ.get("ORT_LIB_LOCATION"):
+        for name in ("LICENSE", "ThirdPartyNotices.txt"):
+            source = pathlib.Path(runtime).parent / name
+            if source.is_file():
+                target = destination / "docs/onnxruntime" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
 
 
 def sign_macos(bundle, executable_directory):

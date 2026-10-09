@@ -44,7 +44,30 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ runner.temp }}/parakeetx-ort
-        key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+        key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', '.github/actions/setup/action.yml') }}
+    - name: Use compatible Linux ONNX Runtime
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # The ort-sys static distribution needs newer glibc and libstdc++ than
+        # AlmaLinux 9. Microsoft's shared CPU build supports our API 24 baseline.
+        runtime_version=1.24.4
+        runtime_sha256=3a211fbea252c1e66290658f1b735b772056149f28321e71c308942cdb54b747
+        runtime_distribution="onnxruntime-linux-x64-$runtime_version"
+        runtime_archive="$ORT_CACHE_DIR/$runtime_distribution.tgz"
+        runtime_directory="$ORT_CACHE_DIR/$runtime_distribution"
+        mkdir -p "$ORT_CACHE_DIR"
+        if [ ! -f "$runtime_archive" ]; then
+          curl --fail --location --retry 3 --connect-timeout 10 --max-time 120 \
+            "https://github.com/microsoft/onnxruntime/releases/download/v$runtime_version/$runtime_distribution.tgz" \
+            --output "$runtime_archive"
+        fi
+        echo "$runtime_sha256  $runtime_archive" | sha256sum --check
+        if [ ! -f "$runtime_directory/lib/libonnxruntime.so" ]; then
+          tar -xzf "$runtime_archive" -C "$ORT_CACHE_DIR"
+        fi
+        echo "ORT_LIB_LOCATION=$runtime_directory/lib" >> "$GITHUB_ENV"
+        echo 'ORT_PREFER_DYNAMIC_LINK=1' >> "$GITHUB_ENV"
     - name: Cache Rust dependencies
       uses: Swatinem/rust-cache@v2
       with:
