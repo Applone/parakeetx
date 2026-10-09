@@ -1,0 +1,70 @@
+name: Set up parakeetx build tools
+description: Install native dependencies, Rust, and Python, and cache compiled dependencies.
+inputs:
+  configuration:
+    description: Debug or Release, used to isolate build caches.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if command -v dnf >/dev/null; then
+          dnf install -y dnf-plugins-core
+          dnf config-manager --set-enabled crb
+          dnf install -y gcc gcc-c++ make clang clang-devel cmake pkgconf-pkg-config \
+            pulseaudio-libs-devel dbus-devel libxkbcommon-devel libX11-devel \
+            wayland-devel python3.12 python3.12-pip curl-minimal ca-certificates \
+            binutils desktop-file-utils
+          ln -sf /usr/bin/python3.12 /usr/local/bin/python
+          ln -sf /usr/bin/python3.12 /usr/local/bin/python3
+        else
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential clang cmake pkg-config libpulse-dev libdbus-1-dev \
+            libxkbcommon-dev libx11-dev libwayland-dev desktop-file-utils
+        fi
+    - name: Check macOS build tools
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        xcrun --sdk macosx --show-sdk-path
+        xcrun clang --version
+        cmake --version
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - name: Set ONNX Runtime cache location
+      shell: bash
+      run: echo "ORT_CACHE_DIR=$RUNNER_TEMP/parakeetx-ort" >> "$GITHUB_ENV"
+    - name: Cache native ONNX Runtime
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/parakeetx-ort
+        key: ort-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+    - name: Cache Rust dependencies
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ runner.os }}-${{ runner.arch }}-${{ inputs.configuration }}
+        save-if: ${{ github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/')) }}
+    - name: Set up Python
+      if: runner.os != 'Linux'
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - name: Install nFPM
+      if: runner.os == 'Linux' && inputs.configuration == 'Release'
+      shell: bash
+      run: |
+        python scripts/install-packaging-tools.py
+    - name: Install NSIS
+      if: runner.os == 'Windows' && inputs.configuration == 'Release'
+      shell: pwsh
+      run: |
+        $version = (Get-Content packaging/tools.json | ConvertFrom-Json).nsis
+        choco install nsis.install --version=$version --no-progress -y
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "${env:ProgramFiles(x86)}\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append

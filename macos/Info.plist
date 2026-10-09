@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.parakeetx.desktop</string>
+    <key>CFBundleName</key>
+    <string>parakeetx</string>
+    <key>CFBundleExecutable</key>
+    <string>parakeetx</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>parakeetx records your microphone to transcribe conversations and create notes.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>parakeetx captures system audio for transcription. Screen images are not saved.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>parakeetx records audio from other applications for transcription.</string>
+</dict>
+</plist>

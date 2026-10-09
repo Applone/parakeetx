@@ -1,0 +1,71 @@
+name: parakeetx
+arch: amd64
+platform: linux
+version: ${PACKAGE_VERSION}
+release: 1
+section: sound
+priority: optional
+maintainer: parakeetx contributors
+description: Local recording, transcription, and speaker-aware notes with NVIDIA Parakeet.
+vendor: parakeetx
+# nFPM does not expand environment variables in this field.
+license: GPL-3.0-only
+contents:
+  - src: ${PACKAGE_ROOT}/usr/lib/parakeetx/
+    dst: /usr/lib/parakeetx
+    type: tree
+    expand: true
+  - src: /usr/lib/parakeetx/parakeetx
+    dst: /usr/bin/parakeetx
+    type: symlink
+  - src: ${PACKAGE_ROOT}/usr/share/
+    dst: /usr/share
+    type: tree
+    expand: true
+overrides:
+  deb:
+    depends:
+      - libc6 (>= 2.34)
+      - libgcc-s1
+      - libstdc++6 (>= 11)
+      - libpulse0
+      - libdbus-1-3
+      - libxkbcommon0
+      - libwayland-client0
+      - libx11-6
+    recommends:
+      - xdg-desktop-portal
+    suggests:
+      - pipewire-pulse | pulseaudio
+      - python3
+      - ffmpeg
+  rpm:
+    depends:
+      - glibc >= 2.34
+      - libgcc
+      - libstdc++ >= 11
+      - pulseaudio-libs
+      - dbus-libs
+      - libxkbcommon
+      - wayland-libs
+      - libX11
+    recommends:
+      - xdg-desktop-portal
+    suggests:
+      - pipewire-pulseaudio
+      - python3.12
+      - ffmpeg
+  archlinux:
+    depends:
+      - glibc>=2.34
+      - gcc-libs
+      - libpulse
+      - dbus
+      - libxkbcommon
+      - wayland
+      - libx11
+    recommends:
+      - xdg-desktop-portal
+      - pipewire-pulse
+      - python
+      - ffmpeg

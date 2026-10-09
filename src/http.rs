@@ -3,6 +3,13 @@ use std::{future::Future, sync::atomic::{AtomicBool, Ordering}, time::Duration};
 use anyhow::{Result, bail, ensure};
 use iced::futures::future::{Either, select};
 
+pub fn client_builder() -> reqwest::ClientBuilder {
+    // Reqwest 0.13 requires a provider with rustls-no-provider. Retain the ring
+    // backend used by our ONNX downloader, without a second crypto toolchain.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::Client::builder()
+}
+
 pub fn run<T>(cancel: &AtomicBool, future: impl Future<Output = Result<T>>) -> Result<T> {
     ensure!(!cancel.load(Ordering::Relaxed), "Operation cancelled");
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -23,6 +30,12 @@ pub fn run<T>(cancel: &AtomicBool, future: impl Future<Output = Result<T>>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clients_initialize_tls_without_a_network_connection() {
+        client_builder().build().unwrap();
+        client_builder().build().unwrap();
+    }
 
     #[test]
     fn cancellation_drops_pending_network_work_promptly() {

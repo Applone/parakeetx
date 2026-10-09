@@ -1,0 +1,94 @@
+name: Release
+on:
+  push:
+    tags: ['*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate-tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check tag matches application version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/verify-release.py --tag "$RELEASE_TAG" --tag-only
+  build:
+    needs: validate-tag
+    uses: ./.github/workflows/build.yml
+    with:
+      configuration: Release
+  install-linux:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: debian-12
+            image: debian:12-slim
+            format: deb
+          - distribution: ubuntu-22.04
+            image: ubuntu:22.04
+            format: deb
+          - distribution: almalinux-9
+            image: almalinux:9
+            format: rpm
+          - distribution: archlinux
+            image: archlinux:base
+            format: archlinux
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: parakeetx-Release-linux-x64-${{ github.sha }}
+          path: artifacts
+      - name: Install, run, and uninstall native Linux package
+        env:
+          PACKAGE_IMAGE: ${{ matrix.image }}
+          PACKAGE_FORMAT: ${{ matrix.format }}
+        run: |
+          PACKAGE_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          export PACKAGE_VERSION
+          docker run --rm \
+            --volume "$PWD/artifacts:/packages:ro" \
+            --volume "$PWD/scripts/test-linux-package.sh:/test-package.sh:ro" \
+            --env PACKAGE_VERSION --env PACKAGE_FORMAT \
+            "$PACKAGE_IMAGE" bash /test-package.sh
+  publish:
+    needs: [build, install-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: parakeetx-Release-*-${{ github.sha }}
+          merge-multiple: true
+          path: artifacts
+      - name: Verify release assets
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/verify-release.py --artifacts artifacts --tag "$RELEASE_TAG"
+          cd artifacts
+          sha256sum --check checksums.txt
+      - name: Publish release and attach packages
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
+          else
+            gh release create "$RELEASE_TAG" artifacts/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+          fi

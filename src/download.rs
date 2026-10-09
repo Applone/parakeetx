@@ -138,7 +138,7 @@ fn fetch_hashed<Hash: Digest + Default>(url: &str, destination: &Path, expected_
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     let mut hasher = Hash::new();
     crate::http::run(cancel, async {
-        let client = reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(60)).build()?;
+        let client = crate::http::client_builder().connect_timeout(Duration::from_secs(30)).read_timeout(Duration::from_secs(60)).build()?;
         let mut response = client.get(url).send().await.context("Cannot reach the model download server")?;
         ensure!(response.status().is_success(), "Download failed with status {}", response.status());
         let total = response.content_length();

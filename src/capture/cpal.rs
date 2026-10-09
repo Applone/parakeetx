@@ -30,13 +30,21 @@ pub fn list() -> Devices {
             }
         }
     }
+    #[cfg(target_os = "macos")]
+    if let Some(device) = super::macos::device() { devices.system.insert(0, device); }
     if devices.system.is_empty() {
-        devices.note = Some("No system audio device was found. On macOS select a virtual input such as BlackHole or Loopback.".into());
+        devices.note = Some(if cfg!(target_os = "macos") {
+            "Native system audio requires macOS 13 or newer. A virtual audio input can be used on older versions."
+        } else { "No system audio device was found. Enable an output device or a loopback input such as Stereo Mix." }.into());
     }
     devices
 }
 
 pub fn run(source: Source, device: Option<String>, control: Control, sender: Sender<(Source, Vec<f32>)>) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if source == Source::System && device.as_deref().is_none_or(|id| id == super::macos::SYSTEM_DEVICE_ID) {
+        return super::macos::run(control, sender);
+    }
     let host = cpal::default_host();
     let selected = match device {
         Some(id) => host.devices()?.find(|candidate| candidate.id().map(|value| value.to_string() == id).unwrap_or(false))

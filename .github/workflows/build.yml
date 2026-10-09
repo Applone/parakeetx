@@ -1,0 +1,91 @@
+name: Build and verify
+on:
+  workflow_call:
+    inputs:
+      configuration:
+        description: Debug or Release.
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    name: ${{ inputs.configuration }} / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            container: almalinux:9
+          - platform: macos-arm64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            container: ''
+          - platform: windows-x64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            container: ''
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_CONFIGURATION: ${{ inputs.configuration }}
+      BUILD_TARGET: ${{ matrix.target }}
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: '2'
+      # Avoid tuning the optional Whisper fallback to the runner's specific CPU.
+      GGML_NATIVE: 'OFF'
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - name: Bootstrap Linux container
+        if: runner.os == 'Linux'
+        run: dnf install -y git tar gzip libstdc++
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          configuration: ${{ inputs.configuration }}
+      - name: Select build profile
+        run: |
+          case "$BUILD_CONFIGURATION" in
+            Debug) echo 'BUILD_PROFILE=dev' >> "$GITHUB_ENV" ;;
+            Release) echo 'BUILD_PROFILE=release' >> "$GITHUB_ENV" ;;
+            *) echo "Unsupported configuration: $BUILD_CONFIGURATION" >&2; exit 1 ;;
+          esac
+      - name: Lint Rust
+        run: cargo clippy --locked --target "$BUILD_TARGET" --profile "$BUILD_PROFILE" --all-targets -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --locked --target "$BUILD_TARGET" --profile "$BUILD_PROFILE" --all-targets
+      - name: Run Python worker tests
+        run: python -m unittest discover -s python -p 'test_*.py' -v
+      - name: Test packaging checks
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: Build application
+        run: cargo build --locked --target "$BUILD_TARGET" --profile "$BUILD_PROFILE" --bin parakeetx
+      - name: Package and verify application
+        run: |
+          package_options=()
+          if [ "$BUILD_CONFIGURATION" = Release ]; then
+            package_options+=(--installers)
+          fi
+          python scripts/package.py --configuration "$BUILD_CONFIGURATION" --target "$BUILD_TARGET" --verify "${package_options[@]}"
+      - name: Upload application
+        uses: actions/upload-artifact@v7
+        with:
+          name: parakeetx-${{ inputs.configuration }}-${{ matrix.platform }}-${{ github.sha }}
+          path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/*.deb
+            artifacts/*.rpm
+            artifacts/*.pkg.tar.zst
+            artifacts/*-setup.exe
+            artifacts/*.dmg
+            artifacts/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

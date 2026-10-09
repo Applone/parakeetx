@@ -370,7 +370,7 @@ impl App {
                     muted("Both sources are mixed into one recording. Avoid selecting the same audio twice."),
                 ].spacing(16);
                 if let Some(note) = &self.devices.note { sources = sources.push(muted(note)); }
-                if cfg!(target_os = "macos") { sources = sources.push(muted("System audio requires a loopback device. Allow microphone access when prompted.")); }
+                if cfg!(target_os = "macos") { sources = sources.push(muted("Native system audio uses ScreenCaptureKit on macOS 13+. Allow Screen & System Audio Recording in Privacy & Security, then restart if prompted. Microphone access is separate.")); }
                 column![self.settings_section("Audio sources", sources)]
             }
             SettingsTab::Transcription => {

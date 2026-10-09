@@ -4,11 +4,18 @@ use anyhow::Result;
 use crossbeam_channel::Sender;
 
 #[cfg(target_os = "linux")]
-#[path = "capture_pulse.rs"]
-mod backend;
+mod pulse;
+#[cfg(target_os = "linux")]
+use pulse as backend;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod timeline;
 #[cfg(not(target_os = "linux"))]
-#[path = "capture_cpal.rs"]
-mod backend;
+mod cpal;
+#[cfg(not(target_os = "linux"))]
+use cpal as backend;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -60,6 +67,14 @@ pub fn devices() -> Devices { backend::list() }
 
 pub fn capture(source: Source, device: Option<String>, control: Control, sender: Sender<(Source, Vec<f32>)>) -> Result<()> {
     backend::run(source, device, control, sender)
+}
+
+pub fn check_permissions(system_device: Option<&str>) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if system_device == Some(macos::SYSTEM_DEVICE_ID) { macos::check_permission()?; }
+    #[cfg(not(target_os = "macos"))]
+    let _ = system_device;
+    Ok(())
 }
 
 #[cfg(test)]

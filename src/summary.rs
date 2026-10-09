@@ -110,7 +110,7 @@ pub fn summarize(settings: &Settings, api_key: &str, transcript: &str, cancel: &
     ensure!(!settings.summary_model.trim().is_empty(), "Choose a summary model in Settings");
     let url = endpoint(&settings.summary_base_url)?;
     crate::http::run(cancel, async {
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(Duration::from_secs(600))
             .connect_timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::none())

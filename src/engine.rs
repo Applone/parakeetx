@@ -330,6 +330,8 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     let devices = capture::devices();
     let microphone = if settings.microphone_enabled { Some(resolve_device(&devices.microphones, settings.microphone_device.as_deref(), "microphone")?) } else { None };
     let system = if settings.system_enabled { Some(resolve_device(&devices.system, settings.system_device.as_deref(), "system audio")?) } else { None };
+    // Request system audio permission before starting either capture thread or creating audio.
+    capture::check_permissions(system.as_deref())?;
     let title = if title.trim().is_empty() { format!("Recording {}", chrono::Local::now().format("%Y-%m-%d %H:%M")) } else { title.trim().into() };
     let mut recording = Recording::new(title, &settings.recordings_dir);
     recording.status = RecordingStatus::Recording;

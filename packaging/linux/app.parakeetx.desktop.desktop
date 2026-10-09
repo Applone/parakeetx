@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=parakeetx
+Comment=Record audio, transcribe conversations, and create notes
+Exec=parakeetx
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;Education;
+Keywords=recording;transcription;diarization;notes;
+StartupNotify=true
