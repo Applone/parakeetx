@@ -83,3 +83,95 @@ fn worker_events_update_live_transcript_and_keep_finished_recordings() {
     assert_eq!(app.page, Page::Library);
     assert_eq!(app.selected.as_ref().unwrap().id, id);
 }
+
+#[test]
+fn provisional_events_replace_the_tail_ignore_other_recordings_and_clear_on_finish() {
+    let (mut app, _directory) = app();
+    let recording = Recording::new("Live recording".into(), &app.resources.as_ref().unwrap().settings.recordings_dir);
+    let id = recording.id.clone();
+    let (commands, input) = crossbeam_channel::unbounded::<(String, Vec<Word>)>();
+    let (ready, acknowledgements) = crossbeam_channel::unbounded();
+    app.start_job(JobKind::Recording, "test", move |reporter| {
+        reporter.recording(&recording);
+        ready.send(()).unwrap();
+        for (id, words) in input {
+            reporter.live_transcript(&id, words);
+            ready.send(()).unwrap();
+        }
+        Ok("Finished".into())
+    });
+    acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _ = app.update(Message::Tick);
+    let word = |text: &str| Word { text: text.into(), start: 0.2, end: 0.8, confidence: 0.0, speaker: None };
+    for (recording_id, text, expected) in [
+        (id.as_str(), "first", "first"), ("another-recording", "stale", "first"), (id.as_str(), "revised", "revised"),
+    ] {
+        commands.send((recording_id.into(), vec![word(text)])).unwrap();
+        acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.live_provisional, vec![word(expected)]);
+        assert!(app.live.as_ref().unwrap().segments.is_empty());
+        assert!(app.live.as_ref().unwrap().transcript().is_empty());
+        app.page = Page::Record;
+        let _ = app.view();
+    }
+    commands.send((id.clone(), Vec::new())).unwrap();
+    acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _ = app.update(Message::Tick);
+    assert!(app.live_provisional.is_empty());
+    commands.send((id, vec![word("last")])).unwrap();
+    acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _ = app.update(Message::Tick);
+    assert!(!app.live_provisional.is_empty());
+    drop(commands);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !app.job.as_ref().unwrap().is_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = app.update(Message::Tick);
+    assert!(app.live_provisional.is_empty() && app.job.is_none());
+}
+
+#[test]
+fn cancelling_a_job_discards_provisional_text_and_whisper_settings_survive_model_switches() {
+    let (mut app, _directory) = app();
+    let recording = Recording::new("Cancelled recording".into(), &app.resources.as_ref().unwrap().settings.recordings_dir);
+    let (resume, wait) = crossbeam_channel::bounded(0);
+    let (ready, acknowledgements) = crossbeam_channel::unbounded();
+    app.start_job(JobKind::Recording, "test", move |reporter| {
+        let word = Word { text: "pending".into(), start: 0.1, end: 0.5, confidence: 0.0, speaker: None };
+        reporter.recording(&recording);
+        reporter.live_transcript(&recording.id, vec![word.clone()]);
+        ready.send(()).unwrap();
+        wait.recv().unwrap();
+        // Simulate a prediction already in flight when cancellation was requested.
+        reporter.live_transcript(&recording.id, vec![word]);
+        ready.send(()).unwrap();
+        wait.recv().unwrap();
+        Ok("Stopped".into())
+    });
+    acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _ = app.update(Message::Tick);
+    assert_eq!(app.live_provisional.len(), 1);
+    let _ = app.update(Message::Cancel);
+    assert!(app.live_provisional.is_empty());
+    resume.send(()).unwrap();
+    acknowledgements.recv_timeout(Duration::from_secs(2)).unwrap();
+    let _ = app.update(Message::Tick);
+    assert!(app.live_provisional.is_empty());
+    resume.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !app.job.as_ref().unwrap().is_finished() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let _ = app.update(Message::Tick);
+    let _ = app.update(Message::Setting(Field::ChunkSeconds, "9".into()));
+    let _ = app.update(Message::Model(TranscriptionModel::default()));
+    assert_eq!(app.draft.build().unwrap().chunk_seconds, 9);
+    let _ = app.view();
+    let _ = app.update(Message::Model(crate::domain::WhisperModel::Tiny.into()));
+    assert_eq!(app.draft.build().unwrap().chunk_seconds, 9);
+    let _ = app.view();
+}

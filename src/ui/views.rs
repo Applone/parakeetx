@@ -148,7 +148,7 @@ impl App {
         let running = self.is_recording();
         let state = if self.stopping { "Saving..." } else if self.paused { "Paused" } else if running { "Recording" } else if self.live.is_some() { "Saved" } else { "" };
         let body: Element<'_, Message> = if let Some(recording) = &self.live {
-            if recording.segments.is_empty() {
+            if recording.segments.is_empty() && self.live_provisional.is_empty() {
                 let message = if !running { "No transcript. Transcribe this recording in Library." }
                     else if !settings.live_transcription { "Live transcription is off. Audio is being saved." }
                     else if self.paused { "Recording paused." }
@@ -283,13 +283,14 @@ impl App {
     }
 
     fn transcript_rows<'a>(&'a self, recording: &'a Recording, id: &'static str, filtering: bool) -> Element<'a, Message> {
-        if recording.segments.is_empty() {
+        let provisional = if id == "live-transcript" { self.live_provisional.as_slice() } else { &[] };
+        if recording.segments.is_empty() && provisional.is_empty() {
             return container(muted("Transcribe this recording to view the text.")).padding(20).center_x(Fill).center_y(Fill).into();
         }
         let filter = if filtering { self.transcript_filter.trim().to_lowercase() } else { String::new() };
         let mut rows = Column::new().spacing(24);
         let matches: Vec<_> = recording.segments.iter().filter(|segment| filter.is_empty() || segment.text.to_lowercase().contains(&filter)).collect();
-        if matches.is_empty() { rows = rows.push(muted("No matching text.")); }
+        if matches.is_empty() && provisional.is_empty() { rows = rows.push(muted("No matching text.")); }
         let skip = if filtering { 0 } else { matches.len().saturating_sub(200) };
         if skip > 0 { rows = rows.push(muted("Earlier text is available in Library.")); }
         for segment in matches.into_iter().skip(skip) {
@@ -298,6 +299,13 @@ impl App {
                 text(segment.speaker.as_deref().unwrap_or("")).size(12).style(style::accent),
             ].spacing(14);
             rows = rows.push(column![header, text(&segment.text).size(16).line_height(1.5)].spacing(8));
+        }
+        if let Some(first) = provisional.first() {
+            let hypothesis = provisional.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
+            rows = rows.push(column![
+                muted(timestamp(first.start)).font(Font::MONOSPACE).size(12),
+                text(hypothesis).size(16).line_height(1.5).style(style::muted),
+            ].spacing(8));
         }
         let scroll = scroll(rows.padding([4, 0])).id(id).height(Fill);
         if filtering {
@@ -384,12 +392,14 @@ impl App {
                     muted(if settings.model.gpu_available() { "GPU acceleration is available." } else { "GPU acceleration is unavailable for this model in this build." }),
                     divider(),
                     self.toggle("Live transcription", Toggle::Live, settings.live_transcription),
-                    self.field("Live interval (seconds)", Field::ChunkSeconds, "5 to 30"),
                 ].spacing(18);
                 if settings.model.is_parakeet() {
-                    options = options.push(muted("Parakeet detects the language automatically and includes word timings. No separate alignment or speech detector is needed."));
+                    options = options
+                        .push(muted("Live updates target a 1-second interval, with 2 seconds of lookahead and up to 10 seconds of preceding audio. Muted words may change as you speak."))
+                        .push(muted("Parakeet detects the language automatically and includes word timings. No separate alignment or speech detector is needed."));
                 } else {
                     options = options
+                        .push(self.field("Live interval (seconds)", Field::ChunkSeconds, "5 to 30"))
                         .push(muted(settings.model.speed_warning().unwrap_or_default()))
                         .push(self.field("Language", Field::Language, "Auto-detect, or en, ru, de..."))
                         .push(self.toggle("Detect speech (Silero)", Toggle::Vad, settings.vad_enabled))

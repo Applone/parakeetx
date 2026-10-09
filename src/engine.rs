@@ -15,11 +15,13 @@ use crate::{
     audio,
     capture::{self, Control, Source},
     diarize,
-    domain::{PipelineInfo, Recording, RecordingStatus},
+    domain::{PipelineInfo, Recording, RecordingStatus, Word},
     settings::{Secrets, Settings},
     storage::Library,
     vad::{self, Speech, Vad, VadOptions},
 };
+
+mod live;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobKind {
@@ -34,6 +36,7 @@ pub enum JobKind {
 #[derive(Debug, Clone)]
 pub enum Event {
     Recording(Box<Recording>),
+    LiveTranscript { recording_id: String, provisional: Vec<Word> },
     AudioSaved,
     Levels { duration: f64, microphone: f32, system: f32 },
     Progress { label: String, fraction: f32 },
@@ -67,6 +70,10 @@ impl Reporter {
 
     pub fn recording(&self, recording: &Recording) {
         let _ = self.sender.send(Event::Recording(Box::new(recording.clone())));
+    }
+
+    pub fn live_transcript(&self, recording_id: &str, provisional: Vec<Word>) {
+        let _ = self.sender.send(Event::LiveTranscript { recording_id: recording_id.into(), provisional });
     }
 
     pub fn check_cancelled(&self) -> Result<()> {
@@ -291,7 +298,9 @@ impl SourceBuffer {
     }
 }
 
-type LiveResult = std::result::Result<Transcript, String>;
+enum LiveUpdate { Whisper(Transcript), Parakeet(live::Update) }
+
+type LiveResult = std::result::Result<LiveUpdate, String>;
 
 fn live_worker(settings: Settings, path: PathBuf, ranges: Receiver<(u64, usize)>, results: Sender<LiveResult>, cancel: Arc<AtomicBool>) -> Result<()> {
     let mut transcriber = Transcriber::load_with_threads(&settings.model_path(), settings.model, settings.use_gpu, settings.alignment_enabled, settings.threads)?;
@@ -317,10 +326,22 @@ fn live_worker(settings: Settings, path: PathBuf, ranges: Receiver<(u64, usize)>
             if language.is_empty() && !transcript.segments.is_empty() {
                 language = transcript.language.clone().unwrap_or_default();
             }
-            if results.send(Ok(transcript)).is_err() { return Ok(()); }
+            if results.send(Ok(LiveUpdate::Whisper(transcript))).is_err() { return Ok(()); }
         }
     }
     Ok(())
+}
+
+fn parakeet_live_worker(settings: Settings, path: PathBuf, input: live::Input, results: Sender<LiveResult>, cancel: Arc<AtomicBool>) -> Result<()> {
+    let mut transcriber = Transcriber::load_with_threads(&settings.model_path(), settings.model, settings.use_gpu, settings.alignment_enabled, settings.threads)?;
+    live::run(input, &cancel, |start, length| {
+        let samples = audio::read_range(&path, start, length)?;
+        ensure!(samples.len() == length, "Live audio window was not completely flushed");
+        let options = TranscribeOptions { threads: settings.threads, offset: start as f64 / f64::from(SAMPLE_RATE), single_pass: true, ..Default::default() };
+        transcriber.run(&samples, &options, &cancel, |_| {})
+    }, |update| {
+        results.send(Ok(LiveUpdate::Parakeet(update))).map_err(|_| anyhow::anyhow!("Live transcript receiver closed"))
+    })
 }
 
 pub fn record(title: String, settings: Settings, secrets: Secrets, library: Library, reporter: Reporter) -> Result<String> {
@@ -358,13 +379,20 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     drop(audio_sender);
     drop(error_sender);
     let (range_sender, range_receiver) = unbounded();
+    let (live_schedule, live_input) = live::channel();
     let (result_sender, result_receiver) = unbounded();
     let live_thread = if settings.live_transcription {
         let config = settings.clone();
         let path = recording.audio_path.clone();
         let cancel = reporter.cancel.clone();
         Some(thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| live_worker(config, path, range_receiver, result_sender.clone(), cancel)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if config.model.is_parakeet() {
+                    parakeet_live_worker(config, path, live_input, result_sender.clone(), cancel)
+                } else {
+                    live_worker(config, path, range_receiver, result_sender.clone(), cancel)
+                }
+            }));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => { let _ = result_sender.send(Err(format!("{error:#}"))); }
@@ -382,7 +410,7 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     let mut microphone_peak = 0.0f32;
     let mut system_peak = 0.0f32;
     let mut live_failed = !settings.live_transcription;
-    let chunk_size = u64::from(settings.chunk_seconds * SAMPLE_RATE);
+    let chunk_size = if settings.model.is_parakeet() { live::UPDATE_SAMPLES } else { u64::from(settings.chunk_seconds * SAMPLE_RATE) };
     let mut capture_error = None;
     let mut was_paused = false;
     let outcome = (|| -> Result<()> {
@@ -427,8 +455,13 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
             recording.duration = written as f64 / f64::from(SAMPLE_RATE);
             if flush_at.elapsed() >= Duration::from_secs(1) || (!live_failed && written - queued >= chunk_size) {
                 writer.flush()?;
-                if !live_failed && written - queued >= chunk_size && range_sender.send((queued, chunk_size as usize)).is_ok() {
-                    queued += chunk_size;
+                if !live_failed && written - queued >= chunk_size {
+                    if settings.model.is_parakeet() {
+                        live_schedule.submit(written, false);
+                        queued = written;
+                    } else if range_sender.send((queued, chunk_size as usize)).is_ok() {
+                        queued += chunk_size;
+                    }
                 }
                 flush_at = Instant::now();
             }
@@ -473,7 +506,10 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     library.save(&recording)?;
     reporter.recording(&recording);
     let _ = reporter.sender.send(Event::AudioSaved);
-    if !live_failed && written > queued {
+    if settings.model.is_parakeet() {
+        // Finalization is durable even when no new samples arrived since the last update.
+        live_schedule.submit(written, true);
+    } else if !live_failed && written > queued {
         let _ = range_sender.send((queued, (written - queued) as usize));
     }
     drop(range_sender);
@@ -516,13 +552,24 @@ fn resolve_device(devices: &[capture::Device], selected: Option<&str>, label: &s
 
 fn collect_live(results: &Receiver<LiveResult>, recording: &mut Recording, library: &Library, reporter: &Reporter, failed: &mut bool) -> Result<()> {
     let mut changed = false;
+    let mut provisional = None;
     for result in results.try_iter() {
         match result {
-            Ok(transcript) => { append_transcript(recording, transcript); changed = true; }
+            Ok(LiveUpdate::Whisper(transcript)) => { append_transcript(recording, transcript); changed = true; }
+            Ok(LiveUpdate::Parakeet(update)) => {
+                if !update.committed.is_empty() {
+                    let mut words: Vec<_> = recording.segments.iter().flat_map(|segment| segment.words.iter().cloned()).collect();
+                    words.extend(update.committed);
+                    recording.segments = asr::segments_from_words(words);
+                    changed = true;
+                }
+                provisional = Some(update.provisional);
+            }
             Err(error) => {
                 *failed = true;
                 recording.error = Some(format!("Live transcription stopped: {error}. Audio continues to be saved."));
                 reporter.warning(recording.error.clone().unwrap_or_default());
+                provisional = Some(Vec::new());
                 changed = true;
             }
         }
@@ -531,12 +578,47 @@ fn collect_live(results: &Receiver<LiveResult>, recording: &mut Recording, libra
         library.save(recording)?;
         reporter.recording(recording);
     }
+    if let Some(words) = provisional { reporter.live_transcript(&recording.id, words); }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provisional_predictions_never_enter_the_library_and_failure_keeps_committed_words() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().join("library.db")).unwrap();
+        let mut recording = Recording::new("Live test".into(), directory.path());
+        let (sender, results) = unbounded();
+        let (events, receiver) = unbounded();
+        let reporter = Reporter { sender: events, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+        let word = |text: &str, start, end| Word { text: text.into(), start, end, confidence: 0.0, speaker: None };
+        let stable = word("committed", 0.1, 0.5);
+        sender.send(Ok(LiveUpdate::Parakeet(live::Update {
+            committed: vec![stable.clone()], provisional: vec![word("temporary", 1.0, 1.5)],
+        }))).unwrap();
+        let mut failed = false;
+        collect_live(&results, &mut recording, &library, &reporter, &mut failed).unwrap();
+        assert_eq!(library.get(&recording.id).unwrap().transcript(), "committed");
+        assert!(library.search("temporary").unwrap().is_empty());
+        assert!(!crate::domain::export(&recording, crate::domain::ExportFormat::Json).unwrap().contains("temporary"));
+        assert!(matches!(receiver.try_iter().last().unwrap(), Event::LiveTranscript { provisional, .. } if provisional[0].text == "temporary"));
+
+        sender.send(Ok(LiveUpdate::Parakeet(live::Update { committed: Vec::new(), provisional: vec![word("revised", 1.1, 1.6)] }))).unwrap();
+        collect_live(&results, &mut recording, &library, &reporter, &mut failed).unwrap();
+        assert_eq!(receiver.len(), 1, "provisional-only changes should not publish saved recording updates");
+        assert!(matches!(receiver.recv().unwrap(), Event::LiveTranscript { provisional, .. } if provisional[0].text == "revised"));
+
+        sender.send(Err("no timestamps".into())).unwrap();
+        collect_live(&results, &mut recording, &library, &reporter, &mut failed).unwrap();
+        assert!(failed);
+        let saved = library.get(&recording.id).unwrap();
+        assert_eq!(saved.segments[0].words, vec![stable]);
+        assert!(saved.error.unwrap().contains("no timestamps"));
+        assert!(matches!(receiver.try_iter().last().unwrap(), Event::LiveTranscript { provisional, .. } if provisional.is_empty()));
+    }
 
     #[test]
     fn pipeline_metadata_distinguishes_native_timestamps_from_dtw() {

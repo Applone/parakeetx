@@ -105,6 +105,15 @@ fn parakeet_transcript(result: parakeet_rs::TranscriptionResult, offset: f64, du
         }
     }
     sanitize_words(&mut words, offset, offset + duration);
+    let mut segments = segments_from_words(words);
+    if segments.is_empty() && !result.text.trim().is_empty() {
+        segments.push(Segment { start: offset, end: offset + duration, text: result.text.trim().into(), words: Vec::new(), speaker: None });
+    }
+    // Parakeet recognizes languages automatically but its ONNX decoder does not expose a language ID.
+    Ok(Transcript { segments, language: None })
+}
+
+pub(crate) fn segments_from_words(words: Vec<Word>) -> Vec<Segment> {
     let mut segments = Vec::new();
     let mut pending: Vec<Word> = Vec::new();
     for word in words {
@@ -118,11 +127,7 @@ fn parakeet_transcript(result: parakeet_rs::TranscriptionResult, offset: f64, du
         if sentence_end { segments.push(segment_from_words(std::mem::take(&mut pending))); }
     }
     if !pending.is_empty() { segments.push(segment_from_words(pending)); }
-    if segments.is_empty() && !result.text.trim().is_empty() {
-        segments.push(Segment { start: offset, end: offset + duration, text: result.text.trim().into(), words: Vec::new(), speaker: None });
-    }
-    // Parakeet recognizes languages automatically but its ONNX decoder does not expose a language ID.
-    Ok(Transcript { segments, language: None })
+    segments
 }
 
 fn segment_from_words(words: Vec<Word>) -> Segment {

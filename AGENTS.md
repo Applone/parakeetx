@@ -43,6 +43,10 @@ Startup uses the UI's `blocking` helper (`tokio::task::spawn_blocking`) to lock 
 
 Imported media is decoded and resampled into a local WAV before metadata is saved. Recording captures enabled sources, mixes them, writes WAV audio, and optionally sends file ranges to a separate live ASR worker. The WAV is flushed before live range reads. Stop finalizes audio and processes the final queued range, then optionally assigns speakers. Offline transcription reads chunks of at most 28 seconds and merges results with recording-relative timestamps. Summaries use transcript text and the recording's prompt override when present, then save the resulting notes.
 
+Parakeet live scheduling and timestamp commitment live in `src/engine/live.rs`. An automatic preset submits a flushed audio endpoint every recorded second, keeps two seconds of right lookahead and up to ten seconds of left context, and caps inference windows at 28 seconds. Pending endpoints replace each other; backlogs advance through bounded overlapping windows without skipping uncommitted audio. Whisper retains disjoint ranges and the persisted `chunk_seconds` interval; that setting is hidden for Parakeet but remains valid when switching models.
+
+Only a contiguous prefix of complete words ending before the lookahead barrier is committed. Word midpoint ownership excludes predictions at/before the previous frontier, including retained left context; no string matching is used. Silence advances the frontier without crossing unresolved words. Provisional words travel in `Event::LiveTranscript` and replace UI-only state; they are absent from recording JSON, search, exports, and notes. Normal stop decodes the final tail with no withheld lookahead; cancellation/failure discards provisional text and keeps saved audio/committed words. Timestamp drift can still affect boundary recognition. Parakeet live updates bypass `asr::merge`; committed words are segmented with `asr::segments_from_words`.
+
 ## Audio and inference invariants
 
 - The shared audio format is **16 kHz mono PCM16 WAV** (`SAMPLE_RATE` in `src/lib.rs`). Capture buffers and ASR samples use floating-point values; saved audio and the Python worker agree on PCM16. Keep offsets in seconds relative to the recording, including chunk offsets.
@@ -79,6 +83,7 @@ Real inference, compressed media, and audio-device integration tests are explici
 
 ```sh
 cargo test --locked --test native_inference -- --ignored
+cargo test --locked --lib real_parakeet_overlapping_windows_and_final_commitment -- --ignored
 cargo test --locked --test media -- --ignored
 cargo test --locked --test recording -- --ignored       # Linux
 cargo test --locked --test macos_capture -- --ignored   # macOS

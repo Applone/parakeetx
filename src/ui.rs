@@ -10,7 +10,7 @@ use iced::{Subscription, Task, widget::text_editor};
 
 use crate::{
     capture::{self, Device, Devices},
-    domain::{ExportFormat, LibraryItem, Recording, TranscriptionModel},
+    domain::{ExportFormat, LibraryItem, Recording, TranscriptionModel, Word},
     engine::{self, Event, Job, JobKind},
     settings::{AppPaths, Appearance, Secrets, Settings},
     storage::Library,
@@ -236,6 +236,7 @@ pub struct App {
     requested_id: Option<String>,
     selected: Option<Recording>,
     live: Option<Recording>,
+    live_provisional: Vec<Word>,
     recording_title: String,
     detail_title: String,
     recording_prompt: text_editor::Content,
@@ -286,7 +287,7 @@ impl App {
             resources: None, fatal: None, page: Page::Record, settings_tab: SettingsTab::General,
             draft: Draft::new(Settings::default(), Secrets::default()),
             devices: Devices::default(), microphone_labels: Vec::new(), system_labels: Vec::new(),
-            items: Vec::new(), search: String::new(), requested_id: None, selected: None, live: None,
+            items: Vec::new(), search: String::new(), requested_id: None, selected: None, live: None, live_provisional: Vec::new(),
             recording_title: String::new(), detail_title: String::new(), recording_prompt: text_editor::Content::new(),
             detail_tab: DetailTab::Transcript, transcript_filter: String::new(), export_format: ExportFormat::Markdown,
             job: None, progress: 0.0, progress_label: String::new(), notice: None,
@@ -371,11 +372,19 @@ impl App {
                     match event {
                         Event::Recording(recording) => {
                             if kind == JobKind::Recording {
+                                if self.live.as_ref().is_none_or(|live| live.id != recording.id) { self.live_provisional.clear(); }
                                 self.live = Some((*recording).clone());
                                 scroll = true;
                             }
                             if kind == JobKind::Import || self.selected.as_ref().is_some_and(|selected| selected.id == recording.id) {
                                 self.show_recording(*recording);
+                            }
+                        }
+                        Event::LiveTranscript { recording_id, provisional } => {
+                            if kind == JobKind::Recording && self.live.as_ref().is_some_and(|live| live.id == recording_id)
+                                && self.job.as_ref().is_some_and(|job| !job.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                                self.live_provisional = provisional;
+                                scroll = true;
                             }
                         }
                         Event::AudioSaved => { self.audio_saved = true; self.microphone_level = 0.0; self.system_level = 0.0; }
@@ -397,6 +406,7 @@ impl App {
                 }
                 if finished {
                     self.job.take();
+                    self.live_provisional.clear();
                     self.paused = false;
                     self.stopping = false;
                     self.audio_saved = false;
@@ -425,7 +435,7 @@ impl App {
             Message::Start if !self.busy() => {
                 let Some(resources) = self.resources.clone() else { return Task::none() };
                 let title = self.recording_title.clone();
-                self.live = None; self.elapsed = 0.0; self.paused = false; self.audio_saved = false; self.stopping = false;
+                self.live = None; self.live_provisional.clear(); self.elapsed = 0.0; self.paused = false; self.audio_saved = false; self.stopping = false;
                 self.start_job(JobKind::Recording, "Opening audio sources", move |reporter| engine::record(title, resources.settings, resources.secrets, resources.library, reporter));
             }
             Message::Pause if self.is_recording() && !self.stopping => {
@@ -439,6 +449,7 @@ impl App {
             }
             Message::Cancel => {
                 if let Some(job) = &self.job { job.cancel(); }
+                self.live_provisional.clear();
                 self.stopping = true;
                 self.progress_label = "Stopping safely; keeping saved audio".into();
             }
@@ -610,6 +621,7 @@ impl App {
             Message::DismissClose => self.close_window = None,
             Message::ConfirmClose => {
                 self.closing = true;
+                self.live_provisional.clear();
                 if let Some(job) = &self.job { job.cancel(); self.progress_label = "Saving audio before closing".into(); }
                 else if let Some(window) = self.close_window { return iced::window::close(window); }
             }

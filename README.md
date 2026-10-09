@@ -7,6 +7,8 @@ A local-first desktop app for recording microphone and system audio, transcribin
 - Searchable local recording library and exports to text, Markdown, JSON, SRT, and VTT.
 - Notes generated through a configurable OpenAI-compatible chat completions endpoint. Generating notes sends transcript text to the configured service.
 
+Parakeet live transcription schedules overlapping windows every second. Recent words appear muted until they pass a two-second lookahead boundary; stopping the recording finalizes the remaining text. Actual latency depends on inference speed. Whisper uses the configurable live interval in Settings.
+
 ## Build and run
 
 Requires Rust 1.88 or newer and native build tools, including CMake and Clang. Linux also needs PulseAudio, D-Bus, X11, Wayland, and libxkbcommon development libraries; see [.github/actions/setup/action.yml](.github/actions/setup/action.yml) for the dependency list. macOS builds require Xcode Command Line Tools; native system-audio capture requires macOS 13 or newer and recording permission.
