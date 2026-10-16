@@ -75,6 +75,8 @@ The worker source is embedded with `include_str!` and written/repaired at `<mode
 
 The subprocess strips inherited credential variables and uses `<models_dir>/huggingface` as `HF_HOME`. The default model is `pyannote/speaker-diarization-community-1`, requiring accepted Hugging Face conditions and a token. The worker supports modern and legacy pyannote output objects, preferring exclusive speaker turns. Rust assigns speakers at word level and splits segments on speaker changes.
 
+`src/diarization_setup.rs` discovers installed uv and optionally creates Python 3.12 CPU environments under `<data>/diarization/envs/`, embedding `python/requirements.txt` for packaged builds. Validate before selecting an interpreter in the settings draft; persistence still requires Save settings. Never rename virtual environments or replace working user environments. Failed/cancelled new environments are removed; successful older environments remain. `src/process.rs` owns subprocess trees for cancellable setup and workers. The worker's `--probe` checks local dependencies only; `--check-model` accepts model/token JSON through stdin and separately loads/downloads model weights without inference. UI readiness is invalidated when relevant settings change.
+
 ## Testing
 
 Rust unit tests live alongside modules; UI tests are in `src/ui/tests.rs`. Tests use temporary workspaces and synthetic audio rather than the user's library. UI rendering/state tests avoid external services. `tests/network.rs` runs local TCP servers for summary and download behavior, so ordinary tests need loopback socket access but no hosted API credentials.

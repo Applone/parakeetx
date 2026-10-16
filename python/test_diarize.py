@@ -24,6 +24,49 @@ class Annotation:
 
 
 class WorkerTests(unittest.TestCase):
+    def model_check(self, payload, factory):
+        protocol = io.StringIO()
+        diagnostics = io.StringIO()
+        fake_audio = types.SimpleNamespace(Pipeline=types.SimpleNamespace(from_pretrained=factory))
+        with patch.object(WORKER, "PROTOCOL_OUTPUT", protocol), patch.object(sys, "stderr", diagnostics), patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), patch.object(sys, "argv", [str(SCRIPT), "--check-model"]), patch.object(WORKER, "dependencies", return_value=(object(), fake_audio)):
+            try:
+                WORKER.main()
+            except SystemExit:
+                pass
+        return json.loads(protocol.getvalue()), diagnostics.getvalue()
+
+    def test_model_check_downloads_without_audio_inference_and_keeps_stdout_clean(self):
+        calls = []
+        def factory(model, token=None):
+            print("download progress")
+            calls.append((model, token))
+            return object()
+        response, diagnostics = self.model_check({"model": "org/model", "token": "secret"}, factory)
+        self.assertTrue(response["ok"])
+        self.assertEqual(calls, [("org/model", "secret")])
+        self.assertIn("download progress", diagnostics)
+
+    def test_model_check_supports_legacy_auth_and_redacts_access_errors(self):
+        calls = []
+        def legacy(model, use_auth_token=None):
+            calls.append(use_auth_token)
+            return object()
+        self.assertTrue(self.model_check({"token": "secret"}, legacy)[0]["ok"])
+        self.assertEqual(calls, ["secret"])
+        def denied(model, token=None):
+            raise RuntimeError(f"denied with {token}")
+        response, _ = self.model_check({"token": "secret"}, denied)
+        self.assertFalse(response["ok"])
+        self.assertNotIn("secret", json.dumps(response))
+        self.assertIn("[redacted]", response["error"])
+        self.assertFalse(self.model_check({}, lambda model: None)[0]["ok"])
+
+    def test_model_check_rejects_malformed_requests_without_importing_dependencies(self):
+        for request in ["invalid", "[]", '{"model":123}', '{"token":{"invalid":true}}']:
+            result = subprocess.run([sys.executable, str(SCRIPT), "--check-model"], input=request, text=True, capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse(json.loads(result.stdout)["ok"])
+
     def test_rejects_invalid_requests_with_machine_readable_response(self):
         for request in ["invalid", "[]", '{}', '{"audio":123}']:
             result = subprocess.run([sys.executable, str(SCRIPT)], input=request, text=True, capture_output=True, timeout=10)

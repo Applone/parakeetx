@@ -77,11 +77,7 @@ def load_waveform(path: str, torch):
     return {"waveform": waveform, "sample_rate": 16000}
 
 
-def diarize(request: dict) -> None:
-    audio = request.get("audio")
-    if not isinstance(audio, str) or not os.path.isfile(audio):
-        fail("The recording audio file does not exist.")
-    torch, pyannote_audio = dependencies()
+def load_pipeline(request: dict):
     model = request.get("model") or "pyannote/speaker-diarization-community-1"
     token = request.get("token") or None
     if not isinstance(model, str) or (token is not None and not isinstance(token, str)):
@@ -91,6 +87,7 @@ def diarize(request: dict) -> None:
         return str(error).replace(token, "[redacted]") if token else str(error)
 
     try:
+        torch, pyannote_audio = dependencies()
         factory = pyannote_audio.Pipeline.from_pretrained
         argument = "token" if "token" in inspect.signature(factory).parameters else "use_auth_token"
         pipeline = factory(model, **{argument: token})
@@ -101,6 +98,19 @@ def diarize(request: dict) -> None:
             f"Cannot load the diarization model: {describe(error)}",
             "Accept its conditions on Hugging Face and supply a valid access token in Settings.",
         )
+    return torch, pipeline, describe
+
+
+def check_model(request: dict) -> None:
+    load_pipeline(request)
+    respond({"ok": True})
+
+
+def diarize(request: dict) -> None:
+    audio = request.get("audio")
+    if not isinstance(audio, str) or not os.path.isfile(audio):
+        fail("The recording audio file does not exist.")
+    torch, pipeline, describe = load_pipeline(request)
 
     options = {}
     for key in ("min_speakers", "max_speakers"):
@@ -138,7 +148,10 @@ def main() -> None:
             fail("Malformed diarization request.")
         if not isinstance(request, dict):
             fail("Diarization request must be a JSON object.")
-        diarize(request)
+        if "--check-model" in sys.argv[1:]:
+            check_model(request)
+        else:
+            diarize(request)
 
 
 if __name__ == "__main__":

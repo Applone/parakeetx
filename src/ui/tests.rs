@@ -11,7 +11,85 @@ fn app() -> (App, tempfile::TempDir) {
         resources: Resources { paths, settings, library, secrets: Secrets::default(), _lock: lock },
         items: Vec::new(), devices: Devices::default(), recovered: 0,
     })));
+    // Rendering/state tests supply detection results rather than invoking user Python.
+    app.speaker_detection = Some(Detection { uv: None, uv_status: "uv not installed".into(), dependencies: Ok("test Python".into()), managed_python: None });
     (app, directory)
+}
+
+#[test]
+fn speaker_setup_selects_only_the_draft_and_requires_explicit_settings_save() {
+    let (mut app, directory) = app();
+    let resources = app.resources.as_ref().unwrap();
+    resources.settings.save(&resources.paths).unwrap();
+    let settings_path = resources.paths.config.join("settings.json");
+    let persisted = std::fs::read(&settings_path).unwrap();
+    let original = resources.settings.python_path.clone();
+    let interpreter = directory.path().join("managed/bin/python");
+    let expected = interpreter.to_string_lossy().into_owned();
+    let revision = app.speaker_revision;
+    app.start_job(JobKind::PythonSetup, "test", move |reporter| {
+        reporter.speaker_setup(revision, diarization_setup::SetupResult { interpreter, description: "validated CPU setup".into() });
+        Ok("Ready".into())
+    });
+    while !app.job.as_ref().unwrap().is_finished() { std::thread::sleep(Duration::from_millis(5)); }
+    let _ = app.update(Message::Tick);
+    assert_eq!(app.draft.settings.python_path, expected);
+    assert_eq!(app.resources.as_ref().unwrap().settings.python_path, original);
+    assert_eq!(std::fs::read(settings_path).unwrap(), persisted);
+    assert!(app.speaker_detection.as_ref().unwrap().dependencies.is_ok());
+    assert!(app.speaker_model.is_none());
+    let _ = app.update(Message::SettingsTab(SettingsTab::Speakers));
+    let _ = app.view();
+    app.speaker_detection.as_mut().unwrap().uv = Some(directory.path().join("uv"));
+    let _ = app.update(Message::RequestSpeakerSetup);
+    assert!(app.confirm_speaker_setup);
+    let _ = app.view();
+    let _ = app.update(Message::DismissSpeakerSetup);
+    assert!(!app.confirm_speaker_setup);
+}
+
+#[test]
+fn speaker_results_ignore_old_settings_and_model_verification_is_invalidated_by_edits() {
+    let (mut app, _directory) = app();
+    let stale = app.speaker_revision;
+    let _ = app.update(Message::Setting(Field::DiarizationModel, "org/new-model".into()));
+    app.start_job(JobKind::SpeakerModelCheck, "test", move |reporter| {
+        reporter.speaker_model_ready(stale);
+        reporter.speaker_detection(stale, Detection { uv: None, uv_status: "stale".into(), dependencies: Err("stale".into()), managed_python: None });
+        Ok("Ready".into())
+    });
+    while !app.job.as_ref().unwrap().is_finished() { std::thread::sleep(Duration::from_millis(5)); }
+    let _ = app.update(Message::Tick);
+    assert!(app.speaker_model.is_none());
+    assert_ne!(app.speaker_detection.as_ref().unwrap().uv_status, "stale");
+    let revision = app.speaker_revision;
+    app.start_job(JobKind::SpeakerModelCheck, "test", move |reporter| { reporter.speaker_model_ready(revision); Ok("Ready".into()) });
+    while !app.job.as_ref().unwrap().is_finished() { std::thread::sleep(Duration::from_millis(5)); }
+    let _ = app.update(Message::Tick);
+    assert!(app.speaker_model.as_ref().unwrap().is_ok());
+    let _ = app.update(Message::Setting(Field::HfToken, "secret-token".into()));
+    assert!(app.speaker_model.is_none());
+    assert!(app.speaker_detection.is_some());
+    let _ = app.update(Message::Setting(Field::Python, "custom-python".into()));
+    assert!(app.speaker_detection.is_none());
+}
+
+#[test]
+fn cancelling_setup_or_receiving_a_stale_setup_result_preserves_the_interpreter() {
+    let (mut app, directory) = app();
+    let original = app.draft.settings.python_path.clone();
+    for stale in [false, true] {
+        let revision = if stale { app.speaker_revision.wrapping_sub(1) } else { app.speaker_revision };
+        let interpreter = directory.path().join("unused-python");
+        app.start_job(JobKind::PythonSetup, "test", move |reporter| {
+            reporter.speaker_setup(revision, diarization_setup::SetupResult { interpreter, description: "ready".into() });
+            Ok("Ready".into())
+        });
+        while !app.job.as_ref().unwrap().is_finished() { std::thread::sleep(Duration::from_millis(5)); }
+        if !stale { app.job.as_ref().unwrap().cancel(); }
+        let _ = app.update(Message::Tick);
+        assert_eq!(app.draft.settings.python_path, original);
+    }
 }
 
 #[test]

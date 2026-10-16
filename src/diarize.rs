@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain::{Segment, Word},
+    process::ManagedChild,
     settings::{Settings, private_directory},
 };
 
@@ -61,7 +62,7 @@ pub fn worker_path(settings: &Settings) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn spawn(settings: &Settings, arguments: &[&str]) -> Result<std::process::Child> {
+fn spawn(settings: &Settings, arguments: &[&str]) -> Result<ManagedChild> {
     ensure!(!settings.python_path.trim().is_empty(), "Set the Python interpreter path in Settings");
     let script = worker_path(settings)?;
     let mut command = Command::new(settings.python_path.trim());
@@ -80,10 +81,10 @@ fn spawn(settings: &Settings, arguments: &[&str]) -> Result<std::process::Child>
     if !settings.models_dir.as_os_str().is_empty() {
         command.env("HF_HOME", settings.models_dir.join("huggingface"));
     }
-    command.spawn().with_context(|| format!("Cannot start Python at '{}'. Install Python 3.10 or newer, or correct the path in Settings.", settings.python_path.trim()))
+    ManagedChild::spawn(&mut command).with_context(|| format!("Cannot start Python at '{}'. Install Python 3.10 or newer, or correct the path in Settings.", settings.python_path.trim()))
 }
 
-fn finish(mut child: std::process::Child, payload: Option<String>, cancel: &AtomicBool, timeout: Duration) -> Result<Response> {
+fn finish(mut child: ManagedChild, payload: Option<String>, cancel: &AtomicBool, timeout: Duration) -> Result<Response> {
     use std::io::Read;
     let stdout = child.stdout.take().context("Cannot read the Python worker output")?;
     let stderr = child.stderr.take().context("Cannot read the Python worker diagnostics")?;
@@ -122,6 +123,7 @@ fn finish(mut child: std::process::Child, payload: Option<String>, cancel: &Atom
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
+            child.stop_tree();
             let mut output = Vec::new();
             let mut diagnostics = Vec::new();
             for _ in 0..2 {
@@ -162,6 +164,21 @@ pub fn probe(settings: &Settings, cancel: &AtomicBool) -> Result<String> {
     let response = finish(child, None, cancel, Duration::from_secs(120))?;
     let device = if response.cuda { "GPU" } else { "CPU" };
     Ok(format!("pyannote.audio {} on Python {} ({device})", response.pyannote, response.python))
+}
+
+pub fn check_model(settings: &Settings, token: &str, cancel: &AtomicBool) -> Result<String> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Model check cancelled");
+    ensure!(!settings.diarization_model.trim().is_empty(), "Set a diarization model in Settings");
+    let payload = serde_json::json!({ "model": settings.diarization_model.trim(), "token": token });
+    let result = (|| -> Result<String> {
+        let child = spawn(settings, &["--check-model"])?;
+        finish(child, Some(serde_json::to_string(&payload)?), cancel, Duration::from_secs(1800))?;
+        Ok("Speaker model downloaded and access verified.".into())
+    })();
+    result.map_err(|error| {
+        let message = format!("{error:#}");
+        anyhow::anyhow!(if token.is_empty() { message } else { message.replace(token, "[redacted]") })
+    })
 }
 
 pub fn run(settings: &Settings, token: &str, audio: &Path, duration: f64, cancel: &AtomicBool) -> Result<Vec<Turn>> {
@@ -310,8 +327,8 @@ mod tests {
     #[test]
     fn draining_both_subprocess_pipes_prevents_deadlocks() {
         let python = if cfg!(windows) { "python" } else { "python3" };
-        let child = Command::new(python).args(["-c", "import sys;sys.stderr.write('x'*200000);sys.stdout.write('{\"ok\":true,\"turns\":[]}\\n')"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let child = ManagedChild::spawn(Command::new(python).args(["-c", "import sys;sys.stderr.write('x'*200000);sys.stdout.write('{\"ok\":true,\"turns\":[]}\\n')"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
         let result = finish(child, None, &AtomicBool::new(false), Duration::from_secs(5)).unwrap();
         assert!(result.ok);
     }
@@ -319,8 +336,8 @@ mod tests {
     #[test]
     fn cancellation_terminates_the_python_worker() {
         let python = if cfg!(windows) { "python" } else { "python3" };
-        let child = Command::new(python).args(["-c", "import time;time.sleep(60)"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let child = ManagedChild::spawn(Command::new(python).args(["-c", "import time;time.sleep(60)"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
         let started = std::time::Instant::now();
         assert!(finish(child, None, &AtomicBool::new(true), Duration::from_secs(90)).is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -335,5 +352,35 @@ mod tests {
         std::fs::write(&path, "tampered").unwrap();
         worker_path(&settings).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), WORKER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_check_sends_credentials_only_on_stdin_and_redacts_worker_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake python");
+        let settings = Settings { python_path: executable.to_string_lossy().into_owned(), models_dir: directory.path().join("models"), ..Settings::default() };
+        for malformed in [false, true] {
+            let source = format!(r#"#!/usr/bin/env python3
+import json,os,sys
+assert '--check-model' in sys.argv
+assert not any(key in os.environ for key in ('HF_TOKEN','HUGGING_FACE_HUB_TOKEN','PARAKEETX_API_KEY'))
+assert 'private-test-token' not in sys.argv
+request = json.load(sys.stdin)
+assert 'audio' not in request
+assert request['token'] == 'private-test-token'
+if {}:
+    print('private-test-token', file=sys.stderr)
+else:
+    print(json.dumps({{'ok':False,'error':'denied private-test-token'}}))
+sys.exit(1)
+"#, if malformed { "True" } else { "False" });
+            std::fs::write(&executable, source).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let error = check_model(&settings, "private-test-token", &AtomicBool::new(false)).unwrap_err().to_string();
+            assert!(!error.contains("private-test-token"));
+            assert!(error.contains("[redacted]"));
+        }
     }
 }

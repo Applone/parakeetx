@@ -18,7 +18,9 @@ cargo run --locked
 cargo run --locked -- --doctor
 ```
 
-Download the selected transcription model in Settings before transcribing. Speaker identification is enabled by default: install `python/requirements.txt` into your chosen Python environment, select that interpreter in Settings, and supply a Hugging Face token after accepting the diarization model's conditions. Alternatively, disable speaker identification; transcription itself runs natively in Rust.
+Download the selected transcription model in Settings before transcribing. Speaker identification is enabled by default. In Settings → Speakers, the app checks your Python dependencies and detects installed uv. Choose **Set up automatically** to download Python 3.12 if needed and install pyannote.audio with CPU dependencies into an isolated environment. After validation, choose **Save settings** to use the selected interpreter. If uv is missing, follow the installation link or locate its executable. You can also install `python/requirements.txt` into your own Python environment and select that interpreter manually. Alternatively, disable speaker identification; transcription itself runs natively in Rust.
+
+Accept the speaker model's conditions on Hugging Face and supply an access token, then use **Verify and download speaker model** to check access and download its weights separately. Checking Python dependencies does not download model weights. Automatic setup stores environments under the application's data directory (`diarization/envs/`); Hugging Face weights stay in the configured models directory. Downloads can be substantial. Setup can be cancelled; failed or cancelled new environments are removed, while existing environments and Python settings are preserved. Older successful environments are retained. Automatic setup installs CPU packages; GPU environments remain a manual option.
 
 Settings and the SQLite library use platform-specific application directories. Set `PARAKEETX_HOME` to an absolute path to use a separate workspace. Optional credentials can be supplied with `HF_TOKEN` and `PARAKEETX_API_KEY`, or saved through the OS credential store.
 
@@ -35,5 +37,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 Rust tests require `python3` on Unix or `python` on Windows. Packaging scripts require Python 3.11 or newer; CI uses 3.12. See [AGENTS.md](AGENTS.md) for architecture, native packaging, and tests requiring audio devices or model fixtures.
+
+To exercise real automatic speaker setup, run `cargo test --locked --lib real_cpu_environment_setup -- --ignored`. This requires installed uv and internet access and downloads Python/CPU dependencies; ordinary tests use fake installers and mocked model loading.
 
 Licensed under [GPL-3.0-only](LICENSE). Bundled fonts and icons have their own license files under `assets/`.

@@ -31,6 +31,8 @@ pub enum JobKind {
     Summary,
     Download,
     PythonCheck,
+    PythonSetup,
+    SpeakerModelCheck,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +43,9 @@ pub enum Event {
     Levels { duration: f64, microphone: f32, system: f32 },
     Progress { label: String, fraction: f32 },
     Warning(String),
+    SpeakerDetection { revision: u64, result: crate::diarization_setup::Detection },
+    SpeakerSetup { revision: u64, result: crate::diarization_setup::SetupResult },
+    SpeakerModelReady { revision: u64 },
     Finished(std::result::Result<String, String>),
 }
 
@@ -60,6 +65,18 @@ pub struct Reporter {
 }
 
 impl Reporter {
+    pub fn speaker_detection(&self, revision: u64, result: crate::diarization_setup::Detection) {
+        let _ = self.sender.send(Event::SpeakerDetection { revision, result });
+    }
+
+    pub fn speaker_setup(&self, revision: u64, result: crate::diarization_setup::SetupResult) {
+        let _ = self.sender.send(Event::SpeakerSetup { revision, result });
+    }
+
+    pub fn speaker_model_ready(&self, revision: u64) {
+        let _ = self.sender.send(Event::SpeakerModelReady { revision });
+    }
+
     pub fn progress(&self, label: impl Into<String>, fraction: f32) {
         let _ = self.sender.send(Event::Progress { label: label.into(), fraction: fraction.clamp(0.0, 1.0) });
     }

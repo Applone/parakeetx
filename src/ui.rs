@@ -10,6 +10,7 @@ use iced::{Subscription, Task, widget::text_editor};
 
 use crate::{
     capture::{self, Device, Devices},
+    diarization_setup::{self, Detection},
     domain::{ExportFormat, LibraryItem, Recording, TranscriptionModel, Word},
     engine::{self, Event, Job, JobKind},
     settings::{AppPaths, Appearance, AudioQuality, Secrets, Settings},
@@ -210,6 +211,15 @@ pub enum Message {
     Devices(Devices),
     DownloadModels,
     ProbePython,
+    PickUv,
+    UvPicked(Option<PathBuf>),
+    RequestSpeakerSetup,
+    ConfirmSpeakerSetup,
+    DismissSpeakerSetup,
+    UseManagedPython,
+    CheckSpeakerModel,
+    OpenUvInstructions,
+    OpenSpeakerModel,
     ClearNotice,
     Close(iced::window::Id),
     DismissClose,
@@ -260,6 +270,12 @@ pub struct App {
     closing: bool,
     saving: bool,
     dialog_open: bool,
+    speaker_detection: Option<Detection>,
+    speaker_model: Option<std::result::Result<String, String>>,
+    speaker_revision: u64,
+    speaker_job_revision: Option<u64>,
+    uv_override: Option<PathBuf>,
+    confirm_speaker_setup: bool,
     width: f32,
 }
 
@@ -295,6 +311,8 @@ impl App {
             paused: false, stopping: false, audio_saved: false, elapsed: 0.0, microphone_level: 0.0, system_level: 0.0,
             confirm_summary: false, confirm_remove: false, close_window: None, closing: false, saving: false, dialog_open: false,
             width: 1280.0,
+            speaker_detection: None, speaker_model: None, speaker_revision: 0, speaker_job_revision: None,
+            uv_override: None, confirm_speaker_setup: false,
         };
         (state, load())
     }
@@ -340,6 +358,31 @@ impl App {
         self.devices = devices;
     }
 
+    fn check_speakers(&mut self) {
+        if self.busy() { return; }
+        match (self.draft.build(), self.resources.clone()) {
+            (Ok(settings), Some(resources)) => {
+                let revision = self.speaker_revision;
+                let uv = self.uv_override.clone();
+                self.speaker_job_revision = Some(revision);
+                self.start_job(JobKind::PythonCheck, "Checking Python, pyannote.audio, and uv", move |reporter| {
+                    let result = diarization_setup::detect(&resources.paths, &settings, uv.as_deref(), &reporter.cancel);
+                    reporter.check_cancelled()?;
+                    reporter.speaker_detection(revision, result);
+                    Ok("Speaker identification setup checked.".into())
+                });
+            }
+            (Err(error), _) => self.set_notice(format!("{error:#}"), true),
+            _ => {}
+        }
+    }
+
+    fn invalidate_speakers(&mut self, dependencies: bool) {
+        self.speaker_revision = self.speaker_revision.wrapping_add(1);
+        self.speaker_model = None;
+        if dependencies { self.speaker_detection = None; }
+    }
+
     fn show_recording(&mut self, recording: Recording) {
         self.detail_title = recording.title.clone();
         self.recording_prompt = text_editor::Content::with_text(&recording.summary_prompt);
@@ -361,7 +404,11 @@ impl App {
                 Err(error) => self.fatal = Some(error),
             },
             Message::Retry => { self.fatal = None; return load(); }
-            Message::Navigate(page) => { self.page = page; if page == Page::Library { return self.reload_library(); } }
+            Message::Navigate(page) => {
+                self.page = page;
+                if page == Page::Library { return self.reload_library(); }
+                if page == Page::Settings && self.settings_tab == SettingsTab::Speakers && self.speaker_detection.is_none() { self.check_speakers(); }
+            }
             Message::Tick => {
                 let (events, kind) = match &self.job {
                     Some(job) => (job.events.try_iter().take(200).collect::<Vec<_>>(), job.kind),
@@ -396,17 +443,36 @@ impl App {
                         }
                         Event::Progress { label, fraction } => { self.progress_label = label; self.progress = fraction; }
                         Event::Warning(warning) => self.set_notice(warning, true),
+                        Event::SpeakerDetection { revision, result } => if revision == self.speaker_revision {
+                            self.speaker_detection = Some(result);
+                        },
+                        Event::SpeakerSetup { revision, result } => if revision == self.speaker_revision && !self.job.as_ref().is_some_and(|job| job.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                            self.draft.settings.python_path = result.interpreter.to_string_lossy().into_owned();
+                            self.speaker_model = None;
+                            if let Some(detection) = &mut self.speaker_detection {
+                                detection.dependencies = Ok(result.description);
+                                detection.managed_python = Some(result.interpreter);
+                            }
+                            self.set_notice("Dependencies ready. Save settings to use this interpreter, then verify the speaker model.", false);
+                        },
+                        Event::SpeakerModelReady { revision } => if revision == self.speaker_revision && !self.job.as_ref().is_some_and(|job| job.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                            self.speaker_model = Some(Ok("Model downloaded and access verified".into()));
+                        },
                         Event::Finished(result) => {
                             finished = true;
                             match result {
                                 Ok(message) => if !self.notice.as_ref().is_some_and(|(_, error)| *error) { self.set_notice(message, false); },
-                                Err(error) => self.set_notice(error, true),
+                                Err(error) => {
+                                    if kind == JobKind::SpeakerModelCheck && self.speaker_job_revision == Some(self.speaker_revision) { self.speaker_model = Some(Err(error.clone())); }
+                                    self.set_notice(error, true);
+                                }
                             }
                         }
                     }
                 }
                 if finished {
                     self.job.take();
+                    self.speaker_job_revision = None;
                     self.live_provisional.clear();
                     self.paused = false;
                     self.stopping = false;
@@ -449,10 +515,11 @@ impl App {
                 self.progress_label = "Saving audio and finishing transcription".into();
             }
             Message::Cancel => {
+                let setup = self.job.as_ref().is_some_and(|job| job.kind == JobKind::PythonSetup);
                 if let Some(job) = &self.job { job.cancel(); }
                 self.live_provisional.clear();
                 self.stopping = true;
-                self.progress_label = "Stopping safely; keeping saved audio".into();
+                self.progress_label = if setup { "Cancelling setup and removing the incomplete environment" } else { "Stopping safely; keeping saved audio" }.into();
             }
             Message::OpenLive => {
                 if let Some(recording) = self.live.clone() { self.show_recording(recording); self.page = Page::Library; return self.reload_library(); }
@@ -549,10 +616,19 @@ impl App {
                     return blocking(move || { resources.library.remove_from_library(&recording.id)?; resources.library.search(&query) }, move |result| Message::SearchResults(result_query, result));
                 }
             }
-            Message::Setting(field, value) => self.draft.edit(field, value),
+            Message::Setting(field, value) => {
+                if self.saving || (self.busy() && matches!(field, Field::Python | Field::ModelsDir | Field::DiarizationModel | Field::HfToken)) { return Task::none(); }
+                if matches!(field, Field::Python | Field::ModelsDir | Field::DiarizationModel | Field::HfToken) {
+                    self.invalidate_speakers(matches!(field, Field::Python | Field::ModelsDir));
+                }
+                self.draft.edit(field, value);
+            }
             Message::Appearance(appearance) if !self.saving => self.draft.settings.appearance = appearance,
             Message::AudioQuality(quality) if !self.saving => self.draft.settings.audio_quality = quality,
-            Message::SettingsTab(tab) => { self.settings_tab = tab; self.page = Page::Settings; }
+            Message::SettingsTab(tab) => {
+                self.settings_tab = tab; self.page = Page::Settings;
+                if tab == SettingsTab::Speakers && self.speaker_detection.is_none() { self.check_speakers(); }
+            }
             Message::Toggle(toggle, value) => match toggle {
                 Toggle::Microphone => self.draft.settings.microphone_enabled = value,
                 Toggle::System => self.draft.settings.system_enabled = value,
@@ -567,11 +643,17 @@ impl App {
             Message::Microphone(label) => self.draft.settings.microphone_device = selected_device(&self.devices.microphones, &self.microphone_labels, &label),
             Message::System(label) => self.draft.settings.system_device = selected_device(&self.devices.system, &self.system_labels, &label),
             Message::SettingsPrompt(action) => self.draft.prompt.perform(action),
-            Message::PickDirectory(field) if !self.dialog_open => {
+            Message::PickDirectory(field) if !self.dialog_open && !(field == Field::ModelsDir && self.busy()) => {
                 self.dialog_open = true;
                 return Task::perform(async { rfd::AsyncFileDialog::new().pick_folder().await.map(|file| file.path().to_owned()) }, move |path| Message::DirectoryPicked(field, path));
             }
-            Message::DirectoryPicked(field, path) => { self.dialog_open = false; if let Some(path) = path { self.draft.edit(field, path.to_string_lossy().into_owned()); } }
+            Message::DirectoryPicked(field, path) => {
+                self.dialog_open = false;
+                if let Some(path) = path {
+                    if field == Field::ModelsDir { self.invalidate_speakers(true); }
+                    self.draft.edit(field, path.to_string_lossy().into_owned());
+                }
+            }
             Message::SaveSettings if !self.busy() => {
                 match (self.draft.build(), self.resources.clone()) {
                     (Ok(settings), Some(resources)) => {
@@ -611,9 +693,58 @@ impl App {
                 }),
                 Err(error) => self.set_notice(format!("{error:#}"), true),
             },
-            Message::ProbePython if !self.busy() => match self.draft.build() {
-                Ok(settings) => self.start_job(JobKind::PythonCheck, "Checking Python and pyannote.audio", move |reporter| crate::diarize::probe(&settings, &reporter.cancel)),
+            Message::ProbePython => self.check_speakers(),
+            Message::PickUv if !self.busy() => {
+                self.dialog_open = true;
+                return Task::perform(async { rfd::AsyncFileDialog::new().set_title("Select uv executable").pick_file().await.map(|file| file.path().to_owned()) }, Message::UvPicked);
+            }
+            Message::UvPicked(path) => {
+                self.dialog_open = false;
+                if let Some(path) = path { self.uv_override = Some(path); self.invalidate_speakers(true); self.check_speakers(); }
+            }
+            Message::RequestSpeakerSetup if !self.busy() && self.speaker_detection.as_ref().is_some_and(|detection| detection.uv.is_some()) => self.confirm_speaker_setup = true,
+            Message::DismissSpeakerSetup => self.confirm_speaker_setup = false,
+            Message::ConfirmSpeakerSetup if !self.busy() && self.confirm_speaker_setup => {
+                self.confirm_speaker_setup = false;
+                let settings = match self.draft.build() {
+                    Ok(settings) => settings,
+                    Err(error) => { self.set_notice(format!("{error:#}"), true); return Task::none(); }
+                };
+                if let (Some(resources), Some(uv)) = (self.resources.clone(), self.speaker_detection.as_ref().and_then(|detection| detection.uv.clone())) {
+                    let revision = self.speaker_revision;
+                    self.speaker_job_revision = Some(revision);
+                    self.start_job(JobKind::PythonSetup, "Setting up speaker identification", move |reporter| {
+                        let result = diarization_setup::install(&resources.paths, &settings, &uv, &reporter.cancel, |label, fraction| reporter.progress(label, fraction))?;
+                        reporter.speaker_setup(revision, result);
+                        Ok("Dependencies ready. Save settings to use this interpreter.".into())
+                    });
+                }
+            }
+            Message::UseManagedPython if !self.busy() => {
+                if let Some(python) = self.speaker_detection.as_ref().and_then(|detection| detection.managed_python.clone()) {
+                    self.draft.settings.python_path = python.to_string_lossy().into_owned();
+                    self.invalidate_speakers(true);
+                    self.check_speakers();
+                }
+            }
+            Message::CheckSpeakerModel if !self.busy() => match self.draft.build() {
+                Ok(settings) => {
+                    let token = self.draft.secrets.huggingface_token.clone();
+                    let revision = self.speaker_revision;
+                    self.speaker_model = None;
+                    self.speaker_job_revision = Some(revision);
+                    self.start_job(JobKind::SpeakerModelCheck, "Verifying access and downloading speaker model", move |reporter| {
+                        let message = crate::diarize::check_model(&settings, &token, &reporter.cancel)?;
+                        reporter.check_cancelled()?;
+                        reporter.speaker_model_ready(revision);
+                        Ok(message)
+                    });
+                }
                 Err(error) => self.set_notice(format!("{error:#}"), true),
+            },
+            Message::OpenUvInstructions => return blocking(|| { open::that(diarization_setup::UV_INSTALL_URL)?; Ok("Opened uv installation instructions.".into()) }, Message::Done),
+            Message::OpenSpeakerModel => if let Some(url) = diarization_setup::model_url(&self.draft.settings.diarization_model) {
+                return blocking(move || { open::that(url)?; Ok("Opened speaker model conditions.".into()) }, Message::Done);
             },
             Message::ClearNotice => self.notice = None,
             Message::Close(window) => {
@@ -624,7 +755,10 @@ impl App {
             Message::ConfirmClose => {
                 self.closing = true;
                 self.live_provisional.clear();
-                if let Some(job) = &self.job { job.cancel(); self.progress_label = "Saving audio before closing".into(); }
+                if let Some(job) = &self.job {
+                    job.cancel();
+                    self.progress_label = if job.kind == JobKind::Recording { "Saving audio before closing" } else { "Stopping the operation before closing" }.into();
+                }
                 else if let Some(window) = self.close_window { return iced::window::close(window); }
             }
             Message::Resize(width) => self.width = width,

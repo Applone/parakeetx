@@ -102,6 +102,14 @@ impl App {
                 muted("Closing stops the active operation. Saved audio and completed transcript segments are kept."),
                 row![secondary("Keep working", Message::DismissClose, !self.closing), action("Stop and close", Message::ConfirmClose, !self.closing)].spacing(12),
             ].spacing(20)
+        } else if self.confirm_speaker_setup {
+            column![
+                text("Set up speaker identification?").size(22),
+                muted("uv will create a separate Python 3.12 environment and download pyannote.audio and CPU dependencies. Downloads can be substantial. Your existing Python setup stays available."),
+                muted(format!("Environment storage: {}", self.resources.as_ref()?.paths.data.join("diarization/envs").display())),
+                muted("After validation, the interpreter will be selected in this draft. Save settings to use it. Model weights are downloaded separately."),
+                row![secondary("Cancel", Message::DismissSpeakerSetup, true), action("Download and set up", Message::ConfirmSpeakerSetup, !self.busy())].spacing(12),
+            ].spacing(20)
         } else if self.confirm_remove && self.page == Page::Library {
             column![
                 text("Remove recording?").size(22),
@@ -417,15 +425,46 @@ impl App {
                 }
                 column![self.settings_section("Transcription", options)]
             }
-            SettingsTab::Speakers => column![self.settings_section("Speaker identification", column![
+            SettingsTab::Speakers => {
+                let detection = self.speaker_detection.as_ref();
+                let checking = self.job.as_ref().is_some_and(|job| job.kind == crate::engine::JobKind::PythonCheck);
+                let dependencies = if checking { "Checking Python dependencies...".to_owned() } else {
+                    match detection.map(|detection| &detection.dependencies) {
+                        Some(Ok(message)) => format!("Dependencies ready: {message}"),
+                        Some(Err(message)) => format!("Dependencies unavailable: {message}"),
+                        None => "Python dependencies have not been checked.".into(),
+                    }
+                };
+                let mut setup = column![
                 self.toggle("Identify speakers", Toggle::Diarization, settings.diarization_enabled),
                 self.field("Python interpreter", Field::Python, "python3 or an absolute path"),
+                muted(dependencies),
+                muted(detection.map(|detection| detection.uv_status.as_str()).unwrap_or("uv has not been checked.")),
+                row![secondary("Check setup", Message::ProbePython, !self.busy()), secondary("Locate uv", Message::PickUv, !self.busy())].spacing(12),
+                ];
+                if detection.is_some_and(|detection| detection.managed_python.is_some()) {
+                    setup = setup.push(secondary("Use managed environment", Message::UseManagedPython, !self.busy()));
+                }
+                if detection.is_some_and(|detection| detection.uv.is_some()) {
+                    setup = setup.push(secondary("Set up automatically", Message::RequestSpeakerSetup, !self.busy()));
+                } else {
+                    setup = setup.push(quiet("uv installation instructions", Message::OpenUvInstructions, !self.busy()));
+                }
+                column![self.settings_section("Speaker identification", setup.spacing(16)), divider(), self.settings_section("Speaker model", column![
                 self.field("Speaker model", Field::DiarizationModel, "pyannote/speaker-diarization-community-1"),
                 self.field("Hugging Face token", Field::HfToken, "Required for gated models"),
+                quiet("Open model conditions on Hugging Face", Message::OpenSpeakerModel, crate::diarization_setup::model_url(&settings.diarization_model).is_some()),
+                muted("Accept the model's conditions and enter an access token. Verification may download weights into your models folder."),
+                muted(match &self.speaker_model {
+                    Some(Ok(message)) => message.as_str(),
+                    Some(Err(_)) => "Model verification failed. See the error below and try again.",
+                    None => if self.job.as_ref().is_some_and(|job| job.kind == crate::engine::JobKind::SpeakerModelCheck) { "Verifying model access and downloading weights..." } else { "Model access has not been verified." },
+                }),
+                secondary("Verify and download speaker model", Message::CheckSpeakerModel, !self.busy() && detection.is_some_and(|detection| detection.dependencies.is_ok())),
                 row![self.field("Minimum speakers", Field::MinSpeakers, "Auto"), self.field("Maximum speakers", Field::MaxSpeakers, "Auto")].spacing(20),
-                secondary("Check Python setup", Message::ProbePython, !self.busy()),
-                muted("Requires Python 3.10+ and pyannote.audio. Accept the model's terms on Hugging Face before use."),
-            ].spacing(20))],
+                muted("Manual Python environments remain supported. Automatic setup installs CPU dependencies; GPU configuration is manual."),
+            ].spacing(20))].spacing(28)
+            }
             SettingsTab::Notes => column![self.settings_section("Notes", column![
                 muted("Connect an OpenAI-compatible API. Transcripts are only sent when you generate notes."),
                 self.field("API base URL", Field::ApiUrl, "Server address including /v1"),
@@ -450,12 +489,15 @@ impl App {
     }
 
     fn field<'a>(&'a self, caption: &'a str, field: Field, placeholder: &'a str) -> Element<'a, Message> {
-        let input = text_input(placeholder, self.draft.value(field)).on_input(move |value| Message::Setting(field, value))
+        let mut input = text_input(placeholder, self.draft.value(field))
             .padding(12).size(13).style(style::field).secure(matches!(field, Field::ApiKey | Field::HfToken));
+        if !self.saving && !(self.busy() && matches!(field, Field::Python | Field::ModelsDir | Field::DiarizationModel | Field::HfToken)) {
+            input = input.on_input(move |value| Message::Setting(field, value));
+        }
         column![label(caption), input].spacing(8).width(Fill).into()
     }
 
     fn path_field<'a>(&'a self, caption: &'a str, field: Field) -> Element<'a, Message> {
-        row![self.field(caption, field, "Absolute folder path"), secondary("Browse", Message::PickDirectory(field), !self.dialog_open)].spacing(12).align_y(Alignment::End).into()
+        row![self.field(caption, field, "Absolute folder path"), secondary("Browse", Message::PickDirectory(field), !self.dialog_open && !(field == Field::ModelsDir && self.busy()))].spacing(12).align_y(Alignment::End).into()
     }
 }
