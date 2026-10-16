@@ -24,6 +24,8 @@ Accept the speaker model's conditions on Hugging Face and supply an access token
 
 Settings and the SQLite library use platform-specific application directories. Set `PARAKEETX_HOME` to an absolute path to use a separate workspace. Optional credentials can be supplied with `HF_TOKEN` and `PARAKEETX_API_KEY`, or saved through the OS credential store.
 
+Save audio source changes in Settings before starting a recording. Recording is blocked while those changes are unsaved, so a disabled source cannot remain active through the previous saved configuration.
+
 Settings → Audio → Audio file quality controls storage for new recordings and imports: Compact (MP3, 32 kbps, about 14 MB/hour), Balanced (MP3, 64 kbps, about 29 MB/hour), or Original (uncompressed WAV, about 115 MB/hour, the default). Existing files are unchanged. MP3 compression runs after capture, live transcription, and speaker identification finish; these use the original 16 kHz mono audio. Transcribing a saved MP3 later uses its compressed audio quality. Processing temporarily needs space for the uncompressed WAV; cancellation or compression failure keeps that WAV available in the library. No external audio converter is required.
 
 ## Development

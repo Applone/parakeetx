@@ -150,6 +150,26 @@ fn draft_validates_numbers_and_retains_secret_fields_outside_settings() {
 }
 
 #[test]
+fn recording_requires_saving_audio_source_changes() {
+    for field in 0..4 {
+        let (mut app, _directory) = app();
+        let saved = app.resources.as_ref().unwrap().settings.clone();
+        match field {
+            0 => { let _ = app.update(Message::Toggle(Toggle::Microphone, false)); }
+            1 => { let _ = app.update(Message::Toggle(Toggle::System, true)); }
+            2 => app.draft.settings.microphone_device = Some("different-microphone".into()),
+            _ => app.draft.settings.system_device = Some("different-system-source".into()),
+        }
+        let _ = app.update(Message::Start);
+        assert!(app.job.is_none());
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_tab, SettingsTab::Audio);
+        assert!(app.notice.as_ref().unwrap().0.contains("Save audio source changes"));
+        assert_eq!(app.resources.as_ref().unwrap().settings.microphone_enabled, saved.microphone_enabled);
+    }
+}
+
+#[test]
 fn worker_events_update_live_transcript_and_keep_finished_recordings() {
     let (mut app, _directory) = app();
     let recording = Recording::new("Finished recording".into(), &app.resources.as_ref().unwrap().settings.recordings_dir);

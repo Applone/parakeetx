@@ -20,7 +20,6 @@ fn real_parakeet_native_timestamps_and_library_pipeline() {
     let audio_path = cache.join("jfk.wav");
     let samples = audio::read_range(&audio_path, 0, 16_000 * 30).unwrap();
     let mut transcriber = Transcriber::load_with_threads(&cache.join(model.filename()), model, false, false, 2).unwrap();
-    assert!(transcriber.alignment_enabled());
     let cancel = Arc::new(AtomicBool::new(false));
     let options = TranscribeOptions { offset: 10.0, ..Default::default() };
     let transcript = transcriber.run(&samples, &options, &cancel, |_| {}).unwrap();

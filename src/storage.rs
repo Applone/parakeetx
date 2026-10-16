@@ -1,4 +1,4 @@
-use std::{path::{Path, PathBuf}, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -123,15 +123,10 @@ impl Library {
         self.connection()?.execute("DELETE FROM recordings WHERE id=?1", [id])?;
         Ok(())
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 fn search_expression(query: &str) -> String {
     query.split_whitespace()
-        .filter(|word| !word.is_empty())
         .map(|word| format!("\"{}\"*", word.replace('"', "\"\"")))
         .collect::<Vec<_>>().join(" AND ")
 }

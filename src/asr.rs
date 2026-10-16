@@ -27,8 +27,6 @@ enum Backend {
 
 pub struct Transcriber {
     backend: Backend,
-    model: TranscriptionModel,
-    alignment: bool,
 }
 
 impl Transcriber {
@@ -53,12 +51,8 @@ impl Transcriber {
             }
             TranscriptionModel::Whisper(model) => Backend::Whisper(WhisperTranscriber::load(path, model, use_gpu, alignment)?),
         };
-        Ok(Self { backend, model, alignment: model.is_parakeet() || alignment })
+        Ok(Self { backend })
     }
-
-    pub fn model(&self) -> TranscriptionModel { self.model }
-
-    pub fn alignment_enabled(&self) -> bool { self.alignment }
 
     pub fn run(&mut self, samples: &[f32], options: &TranscribeOptions, cancel: &Arc<AtomicBool>, progress: impl Fn(f32) + Send + 'static) -> Result<Transcript> {
         ensure!(samples.len() >= SAMPLE_RATE as usize / 10, "Audio is too short to transcribe");
@@ -161,7 +155,7 @@ pub struct Transcript {
 }
 
 impl WhisperTranscriber {
-    pub fn load(path: &Path, model: WhisperModel, use_gpu: bool, alignment: bool) -> Result<Self> {
+    fn load(path: &Path, model: WhisperModel, use_gpu: bool, alignment: bool) -> Result<Self> {
         ensure!(path.is_file(), "Download the {model} weights in Settings first");
         whisper_rs::install_logging_hooks();
         let mut parameters = WhisperContextParameters::default();
@@ -176,10 +170,8 @@ impl WhisperTranscriber {
         Ok(Self { context, alignment })
     }
 
-    pub fn run(&self, samples: &[f32], options: &TranscribeOptions, cancel: &Arc<AtomicBool>, progress: impl Fn(f32) + Send + 'static) -> Result<Transcript> {
-        ensure!(samples.len() >= SAMPLE_RATE as usize / 10, "Audio is too short to transcribe");
+    fn run(&self, samples: &[f32], options: &TranscribeOptions, cancel: &Arc<AtomicBool>, progress: impl Fn(f32) + Send + 'static) -> Result<Transcript> {
         ensure!(!cancel.load(Ordering::Relaxed), "Transcription cancelled");
-        ensure!(options.offset.is_finite() && options.offset >= 0.0, "Invalid transcript offset");
         let mut state = self.context.create_state().context("Cannot allocate a Whisper decoding state")?;
         let mut parameters = if options.single_pass {
             FullParams::new(SamplingStrategy::Greedy { best_of: 1 })

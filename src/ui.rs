@@ -501,6 +501,15 @@ impl App {
             Message::RecordingTitle(title) => self.recording_title = title,
             Message::Start if !self.busy() => {
                 let Some(resources) = self.resources.clone() else { return Task::none() };
+                let saved = &resources.settings;
+                let draft = &self.draft.settings;
+                if saved.microphone_enabled != draft.microphone_enabled || saved.system_enabled != draft.system_enabled
+                    || saved.microphone_device != draft.microphone_device || saved.system_device != draft.system_device {
+                    self.page = Page::Settings;
+                    self.settings_tab = SettingsTab::Audio;
+                    self.set_notice("Save audio source changes in Settings before recording.", true);
+                    return Task::none();
+                }
                 let title = self.recording_title.clone();
                 self.live = None; self.live_provisional.clear(); self.elapsed = 0.0; self.paused = false; self.audio_saved = false; self.stopping = false;
                 self.start_job(JobKind::Recording, "Opening audio sources", move |reporter| engine::record(title, resources.settings, resources.secrets, resources.library, reporter));

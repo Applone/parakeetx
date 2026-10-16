@@ -250,9 +250,12 @@ impl MonoResampler {
         }
         let target = (self.input_count as u64 * u64::from(SAMPLE_RATE)).div_ceil(u64::from(self.input_rate)) as usize;
         let remaining = target.saturating_sub(self.output_count);
+        if remaining == 0 { return Ok(Vec::new()); }
         let mut output = Vec::new();
         let pending: Vec<_> = self.pending.drain(..).collect();
-        let first = self.inner.as_mut().context("Missing resampler")?.process_partial(Some(&[pending]), None)?;
+        // Rubato treats an empty channel as undersized; None flushes delayed samples with silence.
+        let input = if pending.is_empty() { None } else { Some(std::slice::from_ref(&pending)) };
+        let first = self.inner.as_mut().context("Missing resampler")?.process_partial(input, None)?;
         self.append(&first[0], &mut output);
         for _ in 0..16 {
             if output.len() >= remaining {
@@ -287,6 +290,30 @@ mod tests {
             assert_eq!(output.len(), SAMPLE_RATE as usize, "rate {rate}");
             assert!(output.iter().all(|sample| sample.is_finite()));
             assert!(output[1000..2000].iter().any(|sample| sample.abs() > 0.8));
+        }
+    }
+
+    #[test]
+    fn resampler_flushes_empty_and_exact_block_inputs() {
+        for rate in [8000, 16_000, 22_050, 44_100, 48_000, 96_000] {
+            for count in [0, 1, 63, 1023, 1024, 1025, 2048, 4096] {
+                let mut resampler = MonoResampler::new(rate).unwrap();
+                let input = vec![0.5; count];
+                let mut output = Vec::new();
+                for chunk in input.chunks(713) {
+                    output.extend(resampler.push(chunk).unwrap());
+                    assert!(resampler.push(&[]).unwrap().is_empty());
+                }
+                let tail = resampler.finish().unwrap_or_else(|error| panic!("rate {rate}, samples {count}: {error}"));
+                if rate != SAMPLE_RATE && count >= 1024 {
+                    assert!(tail.iter().any(|sample| *sample > 0.1), "Lost audio tail at rate {rate}, samples {count}");
+                }
+                output.extend(tail);
+                let expected = (count as u64 * u64::from(SAMPLE_RATE)).div_ceil(u64::from(rate)) as usize;
+                assert_eq!(output.len(), expected, "rate {rate}, samples {count}");
+                assert!(output.iter().all(|sample| sample.is_finite()));
+                assert!(resampler.finish().unwrap().is_empty());
+            }
         }
     }
 

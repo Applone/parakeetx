@@ -38,7 +38,7 @@ def copy_runtime_libraries(build, destination, platform):
 
 
 def copy_resources(destination):
-    for name in ("LICENSE", "python/requirements.txt", "docs/ci.md", "docs/macos-audio.md"):
+    for name in ("LICENSE", "python/requirements.txt"):
         source = ROOT / name
         if source.is_file():
             target = destination / name

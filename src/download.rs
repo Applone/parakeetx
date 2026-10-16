@@ -169,10 +169,6 @@ fn fetch_hashed<Hash: Digest + Default>(url: &str, destination: &Path, expected_
     Ok(())
 }
 
-pub fn digest(path: &Path) -> Result<String> {
-    digest_hashed::<Sha1>(path, &AtomicBool::new(false))
-}
-
 fn digest_hashed<Hash: Digest + Default>(path: &Path, cancel: &AtomicBool) -> Result<String> {
     let mut file = File::open(path).with_context(|| format!("Cannot read {}", path.display()))?;
     let mut hasher = Hash::new();
@@ -210,8 +206,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("file.bin");
         std::fs::write(&path, b"abc").unwrap();
-        assert_eq!(digest(&path).unwrap(), "a9993e364706816aba3e25717850c26c9cd0d89d");
-        assert!(!digest(&path).unwrap().eq_ignore_ascii_case(WhisperModel::Tiny.sha1()));
+        let digest = digest_hashed::<Sha1>(&path, &AtomicBool::new(false)).unwrap();
+        assert_eq!(digest, "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert!(!digest.eq_ignore_ascii_case(WhisperModel::Tiny.sha1()));
         assert_eq!(digest_hashed::<Sha256>(&path, &AtomicBool::new(false)).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
     }
 

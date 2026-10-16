@@ -1,5 +1,11 @@
 # Working in parakeetx
 
+## Code and documentation discipline
+
+**Keep repository documentation centralized:** maintain one root `README.md`, one root `AGENTS.md`, and optionally one root `CONTRIBUTION.md`. Do not add documentation files for individual directories or features. Required license and third-party notice files are exempt.
+
+Write clean, direct code. Remove unused code and assets, avoid unnecessary functions and abstractions, and keep shared helpers only when they serve a concrete purpose. Preserve functionality and regression coverage when cleaning up.
+
 ## Commands and prerequisites
 
 This is a single Rust 2024 package, with a Rust 1.88 minimum. Run commands from the repository root. `Cargo.lock` is committed; CI uses `--locked`.
@@ -117,4 +123,4 @@ python3 scripts/package.py --configuration Release --target x86_64-unknown-linux
 - `--verify` extracts and smoke-tests archives with library-path overrides removed. Release CI also installs/runs/uninstalls Linux packages in four distribution containers, verifies all eight expected assets, and checks hashes before publishing.
 - Verify a prepared release with `python3 scripts/verify-release.py --artifacts artifacts --tag v0.1.0` (use the actual manifest version). Its tag-only mode is `--tag v0.1.0 --tag-only`.
 
-No existing Cursor, Copilot, Claude, or agent rule files were present when this guide was created. Project licensing is GPL-3.0-only; asset-specific licenses are under `assets/fonts/` and `assets/icons/`.
+Project licensing is GPL-3.0-only; asset-specific licenses are under `assets/fonts/` and `assets/icons/`.
