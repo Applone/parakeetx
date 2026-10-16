@@ -47,7 +47,7 @@ overrides:
       - pulseaudio-libs
       - dbus-libs
       - libxkbcommon
-      - wayland-libs
+      - libwayland-client
       - libX11
     recommends:
       - xdg-desktop-portal

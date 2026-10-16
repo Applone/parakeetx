@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run as root inside an ephemeral distro container with /packages mounted read-only.
 set -euo pipefail
+trap 'echo "Package check failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 shopt -s nullglob
 
 case "$PACKAGE_FORMAT" in
@@ -9,7 +10,9 @@ case "$PACKAGE_FORMAT" in
     test "${#packages[@]}" -eq 1
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install --no-install-recommends -y "${packages[0]}"
+    # Minimal images exclude documentation; keep ours so the license is checked.
+    apt-get install --no-install-recommends -y \
+      -o 'Dpkg::Options::=--path-include=/usr/share/doc/parakeetx/*' "${packages[0]}"
     ;;
   rpm)
     packages=(/packages/*.rpm)
@@ -21,6 +24,8 @@ case "$PACKAGE_FORMAT" in
     packages=(/packages/*.pkg.tar.zst)
     test "${#packages[@]}" -eq 1
     pacman -Syu --noconfirm
+    # Override the base image's documentation exclusion for this package only.
+    printf '\n[options]\nNoExtract = !usr/share/doc/parakeetx !usr/share/doc/parakeetx/*\n' >> /etc/pacman.conf
     pacman -U --noconfirm "${packages[0]}"
     ;;
   *) echo "Unknown package format: $PACKAGE_FORMAT" >&2; exit 1 ;;
