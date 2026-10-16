@@ -42,4 +42,6 @@ Rust tests require `python3` on Unix or `python` on Windows. Packaging scripts r
 
 To exercise real automatic speaker setup, run `cargo test --locked --lib real_cpu_environment_setup -- --ignored`. This requires installed uv and internet access and downloads Python/CPU dependencies; ordinary tests use fake installers and mocked model loading.
 
+To release from a clean working tree, run `./scripts/bump.sh` (patch), or pass `minor`, `major`, or an explicit version such as `1.2.3`. Requires Bash, Git, and Python 3.11+. The script updates `Cargo.toml`, `Cargo.lock`, and the macOS plist, increments the plist build number, commits, creates an annotated `vX.Y.Z` tag, and pushes the current branch and tag atomically to `origin`. The tag triggers the release workflow. If pushing fails, the local commit and tag remain; retry the printed `git push` command after resolving the error.
+
 Licensed under [GPL-3.0-only](LICENSE). Bundled fonts and icons have their own license files under `assets/`.
