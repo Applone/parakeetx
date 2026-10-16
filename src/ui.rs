@@ -12,7 +12,7 @@ use crate::{
     capture::{self, Device, Devices},
     domain::{ExportFormat, LibraryItem, Recording, TranscriptionModel, Word},
     engine::{self, Event, Job, JobKind},
-    settings::{AppPaths, Appearance, Secrets, Settings},
+    settings::{AppPaths, Appearance, AudioQuality, Secrets, Settings},
     storage::Library,
 };
 
@@ -195,6 +195,7 @@ pub enum Message {
     DismissRemove,
     Setting(Field, String),
     Appearance(Appearance),
+    AudioQuality(AudioQuality),
     SettingsTab(SettingsTab),
     Toggle(Toggle, bool),
     Model(TranscriptionModel),
@@ -550,6 +551,7 @@ impl App {
             }
             Message::Setting(field, value) => self.draft.edit(field, value),
             Message::Appearance(appearance) if !self.saving => self.draft.settings.appearance = appearance,
+            Message::AudioQuality(quality) if !self.saving => self.draft.settings.audio_quality = quality,
             Message::SettingsTab(tab) => { self.settings_tab = tab; self.page = Page::Settings; }
             Message::Toggle(toggle, value) => match toggle {
                 Toggle::Microphone => self.draft.settings.microphone_enabled = value,

@@ -23,7 +23,7 @@ fn every_page_and_recording_tab_renders_without_external_services() {
     }
     for model in TranscriptionModel::ALL {
         let _ = app.update(Message::Model(model));
-        for tab in [SettingsTab::Transcription, SettingsTab::Speakers] {
+        for tab in [SettingsTab::General, SettingsTab::Audio, SettingsTab::Transcription, SettingsTab::Speakers, SettingsTab::Notes] {
             let _ = app.update(Message::SettingsTab(tab));
             let _ = app.view();
         }
@@ -62,8 +62,10 @@ fn draft_validates_numbers_and_retains_secret_fields_outside_settings() {
     let _ = app.update(Message::Setting(Field::ApiKey, "private-key".into()));
     let _ = app.update(Message::Toggle(Toggle::Microphone, false));
     let _ = app.update(Message::Toggle(Toggle::System, true));
+    let _ = app.update(Message::AudioQuality(AudioQuality::Balanced));
     let settings = app.draft.build().unwrap();
     assert_eq!(settings.threads, 2);
+    assert_eq!(settings.audio_quality, AudioQuality::Balanced);
     assert!(!settings.microphone_enabled && settings.system_enabled);
     assert!(!serde_json::to_string(&settings).unwrap().contains("private-key"));
     assert_eq!(app.draft.secrets.api_key, "private-key");

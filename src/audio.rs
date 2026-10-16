@@ -1,10 +1,11 @@
-use std::{collections::VecDeque, fs::File, io::{BufReader, BufWriter}, path::Path, sync::atomic::{AtomicBool, Ordering}};
+use std::{collections::VecDeque, fs::File, io::{BufReader, BufWriter, Seek, SeekFrom, Write}, path::{Path, PathBuf}, sync::atomic::{AtomicBool, Ordering}};
 
 use anyhow::{Context, Result, bail, ensure};
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use symphonia::core::{audio::SampleBuffer, codecs::{CODEC_TYPE_NULL, DecoderOptions}, errors::Error as DecodeError, formats::FormatOptions, io::MediaSourceStream, meta::MetadataOptions, probe::Hint};
 
 use crate::SAMPLE_RATE;
+use crate::settings::AudioQuality;
 
 pub type WaveWriter = hound::WavWriter<BufWriter<File>>;
 pub type WaveReader = hound::WavReader<BufReader<File>>;
@@ -36,6 +37,82 @@ pub fn read_range(path: &Path, start: u64, length: usize) -> Result<Vec<f32>> {
     reader.samples::<i16>().take(length)
         .map(|sample| sample.map(|sample| f32::from(sample) / 32768.0).map_err(Into::into))
         .collect()
+}
+
+// Keep inference and the Python protocol on PCM16, even when the stored file is compressed.
+pub struct PreparedAudio {
+    path: PathBuf,
+    _temporary: Option<tempfile::TempDir>,
+}
+
+impl PreparedAudio {
+    pub fn open(source: &Path, cancel: &AtomicBool, progress: impl FnMut(f32)) -> Result<Self> {
+        if open_wave(source).is_ok() {
+            return Ok(Self { path: source.to_owned(), _temporary: None });
+        }
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("audio.wav");
+        import_media(source, &path, cancel, progress)?;
+        Ok(Self { path, _temporary: Some(directory) })
+    }
+
+    pub fn path(&self) -> &Path { &self.path }
+}
+
+// Stage the complete MP3 beside the recording; the caller commits metadata before removing WAV.
+pub fn compress_wave(source: &Path, quality: AudioQuality, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<tempfile::NamedTempFile> {
+    use mp3lame_encoder::{Bitrate, Builder, FlushGap, Mode, MonoPcm, Quality, VbrMode, max_required_buffer_size};
+
+    let bitrate = match quality {
+        AudioQuality::Compact => Bitrate::Kbps32,
+        AudioQuality::Balanced => Bitrate::Kbps64,
+        AudioQuality::Original => bail!("Original audio does not need compression"),
+    };
+    ensure!(!cancel.load(Ordering::Relaxed), "Audio compression cancelled");
+    let mut reader = open_wave(source)?;
+    let total = reader.duration() as usize;
+    ensure!(total > 0, "This recording has no audio");
+    let mut builder = Builder::new().context("Cannot allocate MP3 encoder")?
+        .with_num_channels(1)?.with_mode(Mode::Mono)?
+        .with_sample_rate(SAMPLE_RATE)?.with_output_sample_rate(std::num::NonZeroU32::new(SAMPLE_RATE))?
+        .with_brate(bitrate)?.with_vbr_mode(VbrMode::Off)?.with_quality(Quality::NearBest)?
+        .with_to_write_vbr_tag(true)?;
+    if quality == AudioQuality::Compact {
+        // A 32 kbps CBR frame cannot hold the gapless tag at 16 kHz. ABR uses a
+        // larger metadata frame while targeting the same average audio bitrate.
+        builder.set_vbr_mode(VbrMode::Abr)?;
+        // SAFETY: Builder owns this initialized LAME handle and remains alive;
+        // the setter neither retains nor frees it. The high-level API lacks this setter.
+        let status = unsafe { mp3lame_encoder::ffi::lame_set_VBR_mean_bitrate_kbps(builder.as_ptr(), 32) };
+        ensure!(status == 0, "Cannot configure compact MP3 bitrate");
+    }
+    let mut encoder = builder.build()?;
+    let mut temporary = tempfile::NamedTempFile::new_in(source.parent().context("Audio has no parent directory")?)?;
+    let mut input = reader.samples::<i16>();
+    let mut output = Vec::with_capacity(max_required_buffer_size(SAMPLE_RATE as usize));
+    let mut processed = 0;
+    loop {
+        ensure!(!cancel.load(Ordering::Relaxed), "Audio compression cancelled");
+        let samples = input.by_ref().take(SAMPLE_RATE as usize).collect::<hound::Result<Vec<_>>>()?;
+        if samples.is_empty() { break; }
+        output.clear();
+        encoder.encode_to_vec(MonoPcm(&samples), &mut output)?;
+        temporary.write_all(&output)?;
+        processed += samples.len();
+        progress(processed as f32 / total as f32);
+    }
+    output.clear();
+    encoder.flush_to_vec::<FlushGap>(&mut output)?;
+    temporary.write_all(&output)?;
+    // Replace the placeholder Info frame with the final length, encoder delay and padding.
+    // Gapless decoding keeps transcript timestamps aligned with the saved recording.
+    let mut tag = Vec::with_capacity(encoder.lame_tag_size());
+    encoder.lame_tag_encode_to_vec(&mut tag).context("Cannot finalize MP3 timing metadata")?;
+    temporary.seek(SeekFrom::Start(0))?;
+    temporary.write_all(&tag)?;
+    temporary.as_file().sync_all()?;
+    ensure!(!cancel.load(Ordering::Relaxed), "Audio compression cancelled");
+    Ok(temporary)
 }
 
 pub fn import_media(source: &Path, destination: &Path, cancel: &AtomicBool, mut progress: impl FnMut(f32)) -> Result<f64> {
@@ -228,6 +305,53 @@ mod tests {
         assert!((duration - 1.0).abs() < 0.001);
         assert_eq!(read_range(&target, 0, 20_000).unwrap().len(), 16_000);
         assert!(import_media(&source, &target, &AtomicBool::new(false), |_| {}).is_err());
+    }
+
+    #[test]
+    fn mp3_presets_reduce_size_and_preserve_timing_including_short_tails() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancel = AtomicBool::new(false);
+        for count in [1, 1777, SAMPLE_RATE as usize * 4 + 173] {
+            let source = directory.path().join(format!("{count}.wav"));
+            let samples: Vec<f32> = (0..count).map(|index| {
+                if index > 1000 && index < 2000 { (index as f32 * 440.0 * std::f32::consts::TAU / SAMPLE_RATE as f32).sin() * 0.7 } else { 0.0 }
+            }).collect();
+            let mut writer = hound::WavWriter::create(&source, wave_spec()).unwrap();
+            write_samples(&mut writer, &samples).unwrap();
+            writer.finalize().unwrap();
+            let mut sizes = Vec::new();
+            for quality in [AudioQuality::Compact, AudioQuality::Balanced] {
+                let compressed = directory.path().join("stored.mp3");
+                let temporary = compress_wave(&source, quality, &cancel, |_| {}).unwrap();
+                temporary.persist(&compressed).unwrap();
+                sizes.push(compressed.metadata().unwrap().len());
+                let prepared = PreparedAudio::open(&compressed, &cancel, |_| {}).unwrap();
+                let decoded = read_range(prepared.path(), 0, count + 2000).unwrap();
+                assert_eq!(decoded.len(), count, "{quality}, {count} samples");
+                if count > 2000 {
+                    let peak = decoded.iter().enumerate().max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs())).unwrap().0;
+                    assert!((900..2100).contains(&peak), "MP3 encoder delay must not shift timestamps: {peak}");
+                    assert!(sizes.last().unwrap() < &(source.metadata().unwrap().len() / 3));
+                }
+            }
+            if count > 2000 { assert!(sizes[0] < sizes[1]); }
+            let prepared = PreparedAudio::open(&source, &cancel, |_| {}).unwrap();
+            assert_eq!(prepared.path(), source);
+        }
+    }
+
+    #[test]
+    fn cancelled_compression_discards_staging_and_preserves_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("original.wav");
+        let mut writer = hound::WavWriter::create(&source, wave_spec()).unwrap();
+        write_samples(&mut writer, &vec![0.2; SAMPLE_RATE as usize * 3]).unwrap();
+        writer.finalize().unwrap();
+        let bytes = std::fs::read(&source).unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(compress_wave(&source, AudioQuality::Compact, &cancel, |_| cancel.store(true, Ordering::Relaxed)).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

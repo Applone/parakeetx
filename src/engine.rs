@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use crate::{
     capture::{self, Control, Source},
     diarize,
     domain::{PipelineInfo, Recording, RecordingStatus, Word},
-    settings::{Secrets, Settings},
+    settings::{AudioQuality, Secrets, Settings},
     storage::Library,
     vad::{self, Speech, Vad, VadOptions},
 };
@@ -137,6 +137,7 @@ pub fn import(source: PathBuf, settings: Settings, library: Library, reporter: R
     })?;
     recording.original_path = Some(source);
     library.save(&recording).context("Audio was imported but library metadata could not be saved")?;
+    store_audio(&mut recording, &settings, &library, &reporter);
     reporter.recording(&recording);
     Ok("Recording imported. Ready to transcribe.".into())
 }
@@ -158,13 +159,15 @@ pub fn transcribe(mut recording: Recording, settings: Settings, secrets: Secrets
     if !replacing_transcript { library.save(&recording)?; }
     reporter.recording(&recording);
     let result = (|| -> Result<()> {
-        let reader = audio::open_wave(&recording.audio_path)?;
+        let prepared = audio::PreparedAudio::open(&recording.audio_path, &reporter.cancel, |fraction| reporter.progress("Preparing saved audio", fraction))?;
+        let audio_path = prepared.path();
+        let reader = audio::open_wave(audio_path)?;
         let samples = reader.duration() as usize;
         recording.duration = samples as f64 / f64::from(SAMPLE_RATE);
         ensure!(samples > 0, "This recording has no audio");
         let regions = if let Some(detector) = vad.as_mut() {
             reporter.progress("Finding speech with Silero VAD", 0.0);
-            let mut reader = audio::open_wave(&recording.audio_path)?;
+            let mut reader = audio::open_wave(audio_path)?;
             let mut input = reader.samples::<i16>();
             let mut probabilities = Vec::with_capacity(samples / vad::WINDOW + 1);
             let mut processed = 0usize;
@@ -195,7 +198,7 @@ pub fn transcribe(mut recording: Recording, settings: Settings, secrets: Secrets
             reporter.progress(format!("Transcribing speech region {} of {}", index + 1, chunks.len()), index as f32 / chunks.len() as f32);
             let start = (chunk.start * f64::from(SAMPLE_RATE)).round() as u64;
             let length = ((chunk.end - chunk.start) * f64::from(SAMPLE_RATE)).ceil() as usize;
-            let samples = audio::read_range(&recording.audio_path, start, length)?;
+            let samples = audio::read_range(audio_path, start, length)?;
             if samples.len() < SAMPLE_RATE as usize / 10 { continue; }
             let options = TranscribeOptions { language: language_for(&settings, &recording), threads: settings.threads, offset: start as f64 / f64::from(SAMPLE_RATE), ..Default::default() };
             let result = transcriber.run(&samples, &options, &reporter.cancel, |_| {})?;
@@ -205,7 +208,7 @@ pub fn transcribe(mut recording: Recording, settings: Settings, secrets: Secrets
         }
         recording.status = RecordingStatus::Ready;
         if !replacing_transcript { library.save(&recording)?; }
-        optional_diarization(&mut recording, &settings, &secrets, &reporter)?;
+        optional_diarization(&mut recording, audio_path, &settings, &secrets, &reporter)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -253,11 +256,11 @@ fn append_transcript(recording: &mut Recording, transcript: Transcript) {
     asr::merge(&mut recording.segments, transcript.segments);
 }
 
-fn optional_diarization(recording: &mut Recording, settings: &Settings, secrets: &Secrets, reporter: &Reporter) -> Result<()> {
+fn optional_diarization(recording: &mut Recording, audio_path: &Path, settings: &Settings, secrets: &Secrets, reporter: &Reporter) -> Result<()> {
     if settings.diarization_enabled && !recording.segments.is_empty() {
         reporter.check_cancelled()?;
         reporter.progress("Identifying speakers in the Python worker", 0.0);
-        match diarize::run(settings, &secrets.huggingface_token, &recording.audio_path, recording.duration, &reporter.cancel) {
+        match diarize::run(settings, &secrets.huggingface_token, audio_path, recording.duration, &reporter.cancel) {
             Ok(turns) => {
                 diarize::assign(&mut recording.segments, &turns);
                 recording.segments = diarize::split_on_speaker_change(std::mem::take(&mut recording.segments));
@@ -527,7 +530,8 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
         recording.status = if recording.segments.is_empty() { RecordingStatus::Recorded } else { RecordingStatus::Partial };
         recording.error = Some("Processing stopped. The recorded audio was saved.".into());
     } else {
-        optional_diarization(&mut recording, &settings, &secrets, &reporter)?;
+        let audio_path = recording.audio_path.clone();
+        optional_diarization(&mut recording, &audio_path, &settings, &secrets, &reporter)?;
     }
     if capture_error.is_none() { capture_error = error_receiver.try_recv().ok(); }
     if let Some(error) = capture_error {
@@ -537,9 +541,35 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
         recording.error = Some(format!("Recording interrupted: {error:#}"));
     }
     library.save(&recording)?;
+    store_audio(&mut recording, &settings, &library, &reporter);
     reporter.recording(&recording);
     if let Some(error) = &recording.error { reporter.warning(error); }
     Ok("Recording saved to your library.".into())
+}
+
+fn store_audio(recording: &mut Recording, settings: &Settings, library: &Library, reporter: &Reporter) {
+    if settings.audio_quality == AudioQuality::Original || recording.duration <= 0.0 || reporter.cancel.load(Ordering::Relaxed) { return; }
+    let result = (|| -> Result<()> {
+        let original = recording.audio_path.clone();
+        let destination = original.with_extension("mp3");
+        reporter.progress("Compressing saved audio", 0.0);
+        let temporary = audio::compress_wave(&original, settings.audio_quality, &reporter.cancel, |fraction| reporter.progress("Compressing saved audio", fraction))?;
+        temporary.persist_noclobber(&destination).map_err(|error| error.error)?;
+        let mut compressed = recording.clone();
+        compressed.audio_path = destination.clone();
+        if let Err(error) = library.save(&compressed) {
+            let _ = std::fs::remove_file(&destination);
+            return Err(error).context("Cannot save compressed audio metadata");
+        }
+        *recording = compressed;
+        if let Err(error) = std::fs::remove_file(&original) {
+            reporter.warning(format!("Compressed audio saved, but the original WAV could not be removed at {}: {error}", original.display()));
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        reporter.warning(format!("Audio kept as WAV because compression did not finish: {error:#}"));
+    }
 }
 
 fn resolve_device(devices: &[capture::Device], selected: Option<&str>, label: &str) -> Result<String> {
@@ -585,6 +615,59 @@ fn collect_live(results: &Receiver<LiveResult>, recording: &mut Recording, libra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imports_follow_audio_quality_and_saved_compressed_audio_can_be_prepared() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.wav");
+        let mut writer = hound::WavWriter::create(&source, audio::wave_spec()).unwrap();
+        audio::write_samples(&mut writer, &vec![0.1; SAMPLE_RATE as usize + 173]).unwrap();
+        writer.finalize().unwrap();
+        let library = Library::open(directory.path().join("library.db")).unwrap();
+        for quality in AudioQuality::ALL {
+            let settings = Settings { audio_quality: quality, recordings_dir: directory.path().join(format!("{quality:?}")), models_dir: directory.path().join("models"), ..Default::default() };
+            let (sender, events) = unbounded();
+            let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+            import(source.clone(), settings, library.clone(), reporter).unwrap();
+            let recording = events.try_iter().filter_map(|event| if let Event::Recording(recording) = event { Some(*recording) } else { None }).last().unwrap();
+            assert_eq!(library.get(&recording.id).unwrap().audio_path, recording.audio_path);
+            assert_eq!(recording.audio_path.extension().unwrap(), if quality == AudioQuality::Original { "wav" } else { "mp3" });
+            assert!(recording.audio_path.exists());
+            if quality != AudioQuality::Original { assert!(!recording.audio_path.with_extension("wav").exists()); }
+            let prepared = audio::PreparedAudio::open(&recording.audio_path, &AtomicBool::new(false), |_| {}).unwrap();
+            assert_eq!(audio::open_wave(prepared.path()).unwrap().duration(), SAMPLE_RATE + 173);
+            assert_eq!(recording.original_path.as_deref(), Some(source.as_path()));
+        }
+        assert!(source.exists());
+    }
+
+    #[test]
+    fn failed_or_cancelled_storage_compression_keeps_the_library_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().join("library.db")).unwrap();
+        let mut recording = Recording::new("Storage failure".into(), directory.path());
+        let mut writer = hound::WavWriter::create(&recording.audio_path, audio::wave_spec()).unwrap();
+        audio::write_samples(&mut writer, &vec![0.1; SAMPLE_RATE as usize]).unwrap();
+        writer.finalize().unwrap();
+        recording.duration = 1.0;
+        library.save(&recording).unwrap();
+        let original = recording.audio_path.clone();
+        let destination = original.with_extension("mp3");
+        std::fs::write(&destination, b"existing audio").unwrap();
+        let settings = Settings { audio_quality: AudioQuality::Compact, ..Default::default() };
+        let (sender, events) = unbounded();
+        let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+        store_audio(&mut recording, &settings, &library, &reporter);
+        assert!(events.try_iter().any(|event| matches!(event, Event::Warning(_))));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing audio");
+        assert_eq!(recording.audio_path, original);
+        assert_eq!(library.get(&recording.id).unwrap().audio_path, original);
+        assert_eq!(audio::open_wave(&original).unwrap().duration(), SAMPLE_RATE);
+        reporter.cancel.store(true, Ordering::Relaxed);
+        store_audio(&mut recording, &settings, &library, &reporter);
+        assert!(events.is_empty());
+        assert_eq!(recording.audio_path, original);
+    }
 
     #[test]
     fn provisional_predictions_never_enter_the_library_and_failure_keeps_committed_words() {

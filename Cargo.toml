@@ -19,6 +19,7 @@ crossbeam-channel = "0.5"
 directories = "6"
 fs2 = "0.4"
 hound = "3.5"
+mp3lame-encoder = { version = "0.2.5", features = ["std"] }
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "tokio", "x11", "wayland", "advanced", "svg"] }
 open = "5"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-rustls", "api-24"] }

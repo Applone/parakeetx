@@ -61,12 +61,43 @@ impl std::fmt::Display for Appearance {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AudioQuality {
+    Compact,
+    Balanced,
+    #[default]
+    Original,
+}
+
+impl AudioQuality {
+    pub const ALL: [Self; 3] = [Self::Compact, Self::Balanced, Self::Original];
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Compact => "About 14 MB/hour. Smaller files with reduced audio detail.",
+            Self::Balanced => "About 29 MB/hour. Higher audio quality with smaller files.",
+            Self::Original => "About 115 MB/hour. Uncompressed audio with no additional quality loss.",
+        }
+    }
+}
+
+impl std::fmt::Display for AudioQuality {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Compact => "Compact · MP3 32 kbps",
+            Self::Balanced => "Balanced · MP3 64 kbps",
+            Self::Original => "Original · WAV",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
     pub models_dir: PathBuf,
     pub recordings_dir: PathBuf,
+    pub audio_quality: AudioQuality,
     pub model: TranscriptionModel,
     pub language: String,
     pub threads: usize,
@@ -99,6 +130,7 @@ impl Default for Settings {
             appearance: Appearance::default(),
             models_dir: PathBuf::new(),
             recordings_dir: PathBuf::new(),
+            audio_quality: AudioQuality::default(),
             model: TranscriptionModel::default(),
             language: String::new(),
             threads: std::thread::available_parallelism().map_or(2, |count| count.get().min(8)),
@@ -296,10 +328,12 @@ mod tests {
         assert_eq!(settings.appearance, Appearance::Dark);
         settings.model = WhisperModel::LargeV3.into();
         settings.appearance = Appearance::Light;
+        settings.audio_quality = AudioQuality::Compact;
         settings.save(&paths).unwrap();
         let loaded = Settings::load(&paths).unwrap();
         assert_eq!(loaded.model, WhisperModel::LargeV3.into());
         assert_eq!(loaded.appearance, Appearance::Light);
+        assert_eq!(loaded.audio_quality, AudioQuality::Compact);
         let persisted = fs::read_to_string(paths.config.join("settings.json")).unwrap();
         assert!(!persisted.contains("api_key"));
         assert!(!persisted.contains("huggingface_token"));
@@ -312,6 +346,7 @@ mod tests {
         fs::write(paths.config.join("settings.json"), r#"{"model":"Small","microphone_enabled":false}"#).unwrap();
         let settings = Settings::load(&paths).unwrap();
         assert_eq!(settings.appearance, Appearance::Dark);
+        assert_eq!(settings.audio_quality, AudioQuality::Original);
         assert_eq!(settings.model, WhisperModel::Small.into());
         assert!(!settings.microphone_enabled);
     }

@@ -379,7 +379,16 @@ impl App {
                 ].spacing(16);
                 if let Some(note) = &self.devices.note { sources = sources.push(muted(note)); }
                 if cfg!(target_os = "macos") { sources = sources.push(muted("Native system audio uses ScreenCaptureKit on macOS 13+. Allow Screen & System Audio Recording in Privacy & Security, then restart if prompted. Microphone access is separate.")); }
-                column![self.settings_section("Audio sources", sources)]
+                column![
+                    self.settings_section("Audio sources", sources),
+                    divider(),
+                    self.settings_section("Audio file quality", column![
+                        pick_list(crate::settings::AudioQuality::ALL, Some(settings.audio_quality), Message::AudioQuality)
+                            .width(Fill).padding(12).text_size(14).style(style::select).menu_style(style::menu),
+                        muted(settings.audio_quality.description()),
+                        muted("Applies to new recordings and imports. Existing files stay unchanged. Compression happens after recording and live transcription finish. Future transcription uses the saved audio quality."),
+                    ].spacing(16)),
+                ].spacing(28)
             }
             SettingsTab::Transcription => {
                 let model_path = std::path::PathBuf::from(&self.draft.models_dir).join(settings.model.filename());

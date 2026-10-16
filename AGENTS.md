@@ -49,7 +49,7 @@ Only a contiguous prefix of complete words ending before the lookahead barrier i
 
 ## Audio and inference invariants
 
-- The shared audio format is **16 kHz mono PCM16 WAV** (`SAMPLE_RATE` in `src/lib.rs`). Capture buffers and ASR samples use floating-point values; saved audio and the Python worker agree on PCM16. Keep offsets in seconds relative to the recording, including chunk offsets.
+- The processing audio format is **16 kHz mono PCM16 WAV** (`SAMPLE_RATE` in `src/lib.rs`). Capture buffers and ASR samples use floating-point values; the Python worker consumes PCM16. `Settings::audio_quality` optionally compresses new recordings/imports to MP3 after processing; Original keeps WAV. `audio::PreparedAudio` restores compressed files to temporary PCM16 for offline ASR and diarization. MP3 timing metadata preserves sample alignment. Keep offsets in seconds relative to the recording, including chunk offsets.
 - Linux capture uses PulseAudio, including monitor sources; macOS/Windows use CPAL, with a native ScreenCaptureKit system-audio bridge on macOS. Windows system sources include output-device loopback. Platform modules are selected with `cfg`.
 - macOS bridge code is in `native/screencapturekit.m` and `.h`. `build.rs` compiles it with ARC, blocks, and warnings as errors, targets macOS 13, and links Apple frameworks. System permission is checked before capture threads or WAV creation. Native capture excludes the app's own audio.
 - A selected device that disappeared must produce an error rather than silently substitute another device.
