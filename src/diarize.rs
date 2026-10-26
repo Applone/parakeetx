@@ -49,6 +49,10 @@ struct Response {
     python: String,
     #[serde(default)]
     cuda: bool,
+    #[serde(default)]
+    device: String,
+    #[serde(default)]
+    torch: String,
 }
 
 pub fn worker_path(settings: &Settings) -> Result<PathBuf> {
@@ -79,7 +83,12 @@ fn spawn(settings: &Settings, arguments: &[&str]) -> Result<ManagedChild> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if !settings.models_dir.as_os_str().is_empty() {
-        command.env("HF_HOME", settings.models_dir.join("huggingface"));
+        let cache = settings.speaker_cache_dir();
+        command.env("HF_HOME", settings.models_dir.join("huggingface"))
+            .env("HF_HUB_CACHE", &cache)
+            .env("HUGGINGFACE_HUB_CACHE", &cache)
+            .env("PYANNOTE_CACHE", &cache)
+            .env("TORCH_HOME", settings.models_dir.join("torch"));
     }
     ManagedChild::spawn(&mut command).with_context(|| format!("Cannot start Python at '{}'. Install Python 3.10 or newer, or correct the path in Settings.", settings.python_path.trim()))
 }
@@ -162,8 +171,8 @@ pub fn probe(settings: &Settings, cancel: &AtomicBool) -> Result<String> {
     ensure!(!cancel.load(Ordering::Relaxed), "Python check cancelled");
     let child = spawn(settings, &["--probe"])?;
     let response = finish(child, None, cancel, Duration::from_secs(120))?;
-    let device = if response.cuda { "GPU" } else { "CPU" };
-    Ok(format!("pyannote.audio {} on Python {} ({device})", response.pyannote, response.python))
+    let device = if response.device.is_empty() { if response.cuda { "CUDA" } else { "CPU" } } else { &response.device };
+    Ok(format!("pyannote.audio {} · PyTorch {} on Python {} ({device})", response.pyannote, response.torch, response.python))
 }
 
 pub fn check_model(settings: &Settings, token: &str, cancel: &AtomicBool) -> Result<String> {
@@ -356,6 +365,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn probe_reports_torch_build_and_cuda_or_cpu_details() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("fake python");
+        let settings = Settings { python_path: executable.to_string_lossy().into_owned(), models_dir: directory.path().join("models"), ..Settings::default() };
+        for device in ["CUDA · Test GPU", "CPU · PyTorch has no CUDA support", "CPU · CUDA 12.8 build, but CUDA is unavailable"] {
+            let payload = serde_json::json!({ "ok": true, "pyannote": "4.test", "torch": "2.test", "python": "3.12.test", "device": device });
+            std::fs::write(&executable, format!("#!/usr/bin/env python3\nprint({:?})\n", payload.to_string())).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let description = probe(&settings, &AtomicBool::new(false)).unwrap();
+            assert!(description.contains(device));
+            assert!(description.contains("PyTorch 2.test"));
+            assert!(description.contains("Python 3.12.test"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn model_check_sends_credentials_only_on_stdin_and_redacts_worker_failures() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
@@ -367,6 +394,11 @@ import json,os,sys
 assert '--check-model' in sys.argv
 assert not any(key in os.environ for key in ('HF_TOKEN','HUGGING_FACE_HUB_TOKEN','PARAKEETX_API_KEY'))
 assert 'private-test-token' not in sys.argv
+cache = os.path.join(os.environ['HF_HOME'], 'hub')
+assert os.environ['HF_HUB_CACHE'] == cache
+assert os.environ['HUGGINGFACE_HUB_CACHE'] == cache
+assert os.environ['PYANNOTE_CACHE'] == cache
+assert os.environ['TORCH_HOME'] == os.path.join(os.path.dirname(os.environ['HF_HOME']), 'torch')
 request = json.load(sys.stdin)
 assert 'audio' not in request
 assert request['token'] == 'private-test-token'

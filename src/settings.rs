@@ -141,7 +141,7 @@ impl Default for Settings {
             system_device: None,
             live_transcription: true,
             chunk_seconds: 12,
-            vad_enabled: false,
+            vad_enabled: true,
             vad_threshold: 0.5,
             alignment_enabled: true,
             diarization_enabled: true,
@@ -221,7 +221,7 @@ impl Settings {
     }
 
     pub fn uses_vad(&self) -> bool {
-        !self.model.is_parakeet() && self.vad_enabled
+        self.vad_enabled
     }
 
     pub fn uses_dtw(&self) -> bool {
@@ -230,6 +230,10 @@ impl Settings {
 
     pub fn vad_path(&self) -> PathBuf {
         self.models_dir.join("silero_vad.onnx")
+    }
+
+    pub fn speaker_cache_dir(&self) -> PathBuf {
+        self.models_dir.join("huggingface").join("hub")
     }
 }
 
@@ -303,8 +307,8 @@ mod tests {
         assert!(settings.model.is_parakeet());
         assert!(settings.diarization_enabled);
         assert_eq!(settings.diarization_model, "pyannote/speaker-diarization-community-1");
-        assert!(!settings.uses_vad() && !settings.uses_dtw());
-        let settings = Settings { vad_enabled: true, ..settings };
+        assert!(settings.uses_vad() && !settings.uses_dtw());
+        let settings = Settings { vad_enabled: false, ..settings };
         assert!(!settings.uses_vad());
         let serialized = serde_json::to_string(&settings).unwrap();
         assert!(serde_json::from_str::<Settings>(&serialized).unwrap().model.is_parakeet());

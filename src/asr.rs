@@ -43,9 +43,14 @@ impl Transcriber {
                 let provider = if use_gpu { ExecutionProvider::Cuda } else { provider };
                 #[cfg(not(feature = "cuda"))]
                 let _ = use_gpu;
-                let encoder = ExecutionConfig::new().with_execution_provider(provider).with_intra_threads(threads.clamp(1, 128));
+                // TDT alternates encoder and token decoding. Let idle ONNX workers sleep
+                // instead of burning CPU while another graph (or capture) is running.
+                let config = ExecutionConfig::new().with_custom_configure(|builder| {
+                    Ok(builder.with_intra_op_spinning(false)?.with_inter_op_spinning(false)?)
+                });
+                let encoder = config.clone().with_execution_provider(provider).with_intra_threads(threads.clamp(1, 128));
                 // The joint graph runs for every token; a single CPU thread avoids scheduling overhead.
-                let joint = ExecutionConfig::new().with_intra_threads(1);
+                let joint = config.with_intra_threads(1);
                 Backend::Parakeet(Box::new(ParakeetTDT::from_pretrained_with_joint_config(path, Some(encoder), Some(joint))
                     .context("Cannot load Parakeet. Re-download its weights in Settings.")?))
             }

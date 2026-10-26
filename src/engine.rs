@@ -354,9 +354,16 @@ fn live_worker(settings: Settings, path: PathBuf, ranges: Receiver<(u64, usize)>
 
 fn parakeet_live_worker(settings: Settings, path: PathBuf, input: live::Input, results: Sender<LiveResult>, cancel: Arc<AtomicBool>) -> Result<()> {
     let mut transcriber = Transcriber::load_with_threads(&settings.model_path(), settings.model, settings.use_gpu, settings.alignment_enabled, settings.threads)?;
+    let mut detector = if settings.uses_vad() { Some(Vad::load(&settings.vad_path())?) } else { None };
     live::run(input, &cancel, |start, length| {
         let samples = audio::read_range(&path, start, length)?;
         ensure!(samples.len() == length, "Live audio window was not completely flushed");
+        // Gate the entire context window, rather than trimming speech boundaries.
+        // Retained speech keeps the decoder running long enough to finalize its tail.
+        if let Some(detector) = detector.as_mut()
+            && !detector.contains_speech(&samples, settings.vad_threshold)? {
+            return Ok(Transcript { segments: Vec::new(), language: None });
+        }
         let options = TranscribeOptions { threads: settings.threads, offset: start as f64 / f64::from(SAMPLE_RATE), single_pass: true, ..Default::default() };
         transcriber.run(&samples, &options, &cancel, |_| {})
     }, |update| {
@@ -726,7 +733,7 @@ mod tests {
         let info = pipeline_info(&settings);
         assert_eq!(info.model, "parakeet-tdt-0.6b-v3");
         assert!(info.word_timestamps);
-        assert!(!info.dtw && !info.vad && !info.diarization);
+        assert!(info.vad && !info.dtw && !info.diarization);
         let settings = Settings { model: crate::domain::WhisperModel::Tiny.into(), alignment_enabled: true, ..settings };
         let info = pipeline_info(&settings);
         assert!(info.dtw && info.vad && info.word_timestamps);

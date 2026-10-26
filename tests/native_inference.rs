@@ -50,7 +50,7 @@ fn real_parakeet_native_timestamps_and_library_pipeline() {
     assert_eq!(result.status, RecordingStatus::Ready);
     assert_eq!(result.pipeline.model, "parakeet-tdt-0.6b-v3");
     assert!(result.pipeline.word_timestamps);
-    assert!(!result.pipeline.vad && !result.pipeline.dtw);
+    assert!(result.pipeline.vad && !result.pipeline.dtw);
     assert!(!library.search("country").unwrap().is_empty());
 }
 

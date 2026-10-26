@@ -8,7 +8,9 @@ use crossbeam_channel::{Receiver, Sender, RecvTimeoutError, bounded};
 
 use crate::{SAMPLE_RATE, asr::Transcript, domain::Word};
 
-pub(super) const UPDATE_SAMPLES: u64 = SAMPLE_RATE as u64;
+// Each decode reprocesses the retained context. Batch new audio to avoid
+// repeatedly running the full encoder for only one second of new speech.
+pub(super) const UPDATE_SAMPLES: u64 = 3 * SAMPLE_RATE as u64;
 const LOOKAHEAD: f64 = 2.0;
 const LEFT_SAMPLES: u64 = 10 * SAMPLE_RATE as u64;
 const MAX_SAMPLES: u64 = 28 * SAMPLE_RATE as u64;
@@ -268,6 +270,31 @@ mod tests {
         assert!(windows[1].0 < windows[0].1, "left and right audio context must overlap");
         assert_eq!(windows.last().unwrap().1, samples(90.0));
         assert_eq!(committed, expected);
+    }
+
+    #[test]
+    fn batched_updates_reduce_decoded_audio_without_losing_words() {
+        let duration = samples(90.0);
+        let expected: Vec<_> = (0..90).map(|second| word("repeat", f64::from(second) + 0.2, f64::from(second) + 0.7)).collect();
+        let mut work = Vec::new();
+        for interval in [samples(1.0), UPDATE_SAMPLES] {
+            let (schedule, input) = channel();
+            schedule.submit(interval, false);
+            let mut decoded_samples = 0u64;
+            let mut committed = Vec::new();
+            run(input, &AtomicBool::new(false), |start, length| {
+                decoded_samples += length as u64;
+                let end = start + length as u64;
+                let next = (end + interval).min(duration);
+                schedule.submit(next, next == duration);
+                let begin = start as f64 / f64::from(SAMPLE_RATE);
+                let end = end as f64 / f64::from(SAMPLE_RATE);
+                Ok(transcript(expected.iter().filter(|word| word.start >= begin && word.end <= end).cloned().collect()))
+            }, |update| { committed.extend(update.committed); Ok(()) }).unwrap();
+            assert_eq!(committed, expected);
+            work.push(decoded_samples);
+        }
+        assert!(work[1] * 2 < work[0], "batched updates should more than halve repeated audio processing: {work:?}");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use crate::{diarize, process, settings::{AppPaths, Settings, atomic_write, private_directory}};
 
 const REQUIREMENTS: &str = include_str!("../python/requirements.txt");
+const READY: &str = concat!("# torch-backend=auto\n", include_str!("../python/requirements.txt"));
 pub const UV_INSTALL_URL: &str = "https://docs.astral.sh/uv/getting-started/installation/";
 
 #[derive(Clone, Debug)]
@@ -53,7 +54,7 @@ fn validate_uv(uv: &Path, cancel: &AtomicBool) -> Result<String> {
     let version = process::run(command(uv).arg("--version"), cancel, Duration::from_secs(10), "Checking uv")?;
     ensure!(version.trim_start().starts_with("uv "), "The selected executable is not uv");
     let help = process::run(command(uv).args(["pip", "install", "--help"]), cancel, Duration::from_secs(10), "Checking uv capabilities")?;
-    ensure!(cfg!(target_os = "macos") || help.contains("--torch-backend"), "Update uv to support CPU-only PyTorch installation, then check again");
+    ensure!(cfg!(target_os = "macos") || help.contains("--torch-backend"), "Update uv to support automatic PyTorch backend selection, then check again");
     Ok(version.trim().to_owned())
 }
 
@@ -77,16 +78,23 @@ fn find_uv(selected: Option<&Path>, cancel: &AtomicBool) -> (Option<PathBuf>, St
     (None, last_error)
 }
 
-fn environment_root(paths: &AppPaths) -> PathBuf { paths.data.join("diarization").join("envs") }
+pub fn environment_root(settings: &Settings) -> PathBuf { settings.models_dir.join("diarization").join("envs") }
+
+fn setup_command(uv: &Path, settings: &Settings) -> Command {
+    let mut command = command(uv);
+    command.env("UV_CACHE_DIR", settings.models_dir.join("diarization/cache"))
+        .env("UV_PYTHON_INSTALL_DIR", settings.models_dir.join("diarization/python"));
+    command
+}
 
 pub fn interpreter(environment: &Path) -> PathBuf {
     environment.join(if cfg!(windows) { "Scripts/python.exe" } else { "bin/python" })
 }
 
-fn managed_candidates(paths: &AppPaths) -> Vec<PathBuf> {
-    let Ok(entries) = fs::read_dir(environment_root(paths)) else { return Vec::new() };
+fn managed_candidates(root: &Path, markers: &[&str]) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else { return Vec::new() };
     let mut candidates: Vec<_> = entries.flatten().filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .filter(|entry| fs::read_to_string(entry.path().join("ready.txt")).is_ok_and(|contents| contents == REQUIREMENTS))
+        .filter(|entry| fs::read_to_string(entry.path().join("ready.txt")).is_ok_and(|contents| markers.contains(&contents.as_str())))
         .collect();
     candidates.sort_by_key(|entry| std::cmp::Reverse(entry.metadata().and_then(|metadata| metadata.modified()).ok()));
     candidates.into_iter().map(|entry| interpreter(&entry.path())).collect()
@@ -100,7 +108,10 @@ fn detect_with_probe(paths: &AppPaths, settings: &Settings, selected_uv: Option<
     let dependencies = probe(settings, cancel).map_err(|error| format!("{error:#}"));
     let (uv, uv_status) = find_uv(selected_uv, cancel);
     let mut managed_python = None;
-    for python in managed_candidates(paths) {
+    // Keep old managed environments discoverable without moving their absolute paths.
+    let mut candidates = managed_candidates(&environment_root(settings), &[READY, REQUIREMENTS]);
+    candidates.extend(managed_candidates(&paths.data.join("diarization/envs"), &[READY, REQUIREMENTS]));
+    for python in candidates {
         if cancel.load(Ordering::Relaxed) { break; }
         if python.to_string_lossy() == settings.python_path && dependencies.is_ok() {
             managed_python = Some(python);
@@ -113,44 +124,46 @@ fn detect_with_probe(paths: &AppPaths, settings: &Settings, selected_uv: Option<
     Detection { uv, uv_status, dependencies, managed_python }
 }
 
-pub fn install(paths: &AppPaths, settings: &Settings, uv: &Path, cancel: &AtomicBool, mut progress: impl FnMut(&str, f32)) -> Result<SetupResult> {
+pub fn install(settings: &Settings, uv: &Path, cancel: &AtomicBool, mut progress: impl FnMut(&str, f32)) -> Result<SetupResult> {
     validate_uv(uv, cancel)?;
-    for python in managed_candidates(paths) {
+    install_with_probe(settings, uv, cancel, &mut progress, diarize::probe)
+}
+
+fn install_with_probe(settings: &Settings, uv: &Path, cancel: &AtomicBool, progress: &mut impl FnMut(&str, f32), mut probe: impl FnMut(&Settings, &AtomicBool) -> Result<String>) -> Result<SetupResult> {
+    ensure!(!cancel.load(Ordering::Relaxed), "Setup cancelled");
+    // Old CPU-only environments remain selectable, but must not prevent a CUDA-capable setup.
+    for python in managed_candidates(&environment_root(settings), &[READY]) {
         ensure!(!cancel.load(Ordering::Relaxed), "Setup cancelled");
         let mut candidate = settings.clone();
         candidate.python_path = python.to_string_lossy().into_owned();
         progress("Checking existing managed environment", 0.0);
-        if let Ok(description) = diarize::probe(&candidate, cancel) {
+        if let Ok(description) = probe(&candidate, cancel) {
             ensure!(!cancel.load(Ordering::Relaxed), "Setup cancelled");
             progress("Existing speaker identification environment is ready", 1.0);
             return Ok(SetupResult { interpreter: python, description });
         }
     }
-    install_with_probe(paths, settings, uv, cancel, &mut progress, diarize::probe)
-}
-
-fn install_with_probe(paths: &AppPaths, settings: &Settings, uv: &Path, cancel: &AtomicBool, progress: &mut impl FnMut(&str, f32), probe: impl FnOnce(&Settings, &AtomicBool) -> Result<String>) -> Result<SetupResult> {
     ensure!(!cancel.load(Ordering::Relaxed), "Setup cancelled");
-    let root = environment_root(paths);
+    let root = environment_root(settings);
     private_directory(&root)?;
     // Keep the final path from creation onward: virtual environments contain absolute paths.
-    let environment = tempfile::Builder::new().prefix("python312-cpu-").tempdir_in(&root)?;
+    let environment = tempfile::Builder::new().prefix("python312-auto-").tempdir_in(&root)?;
     let python = interpreter(environment.path());
     let mut candidate = settings.clone();
     candidate.python_path = python.to_str().context("Environment path contains invalid characters")?.to_owned();
     progress("Creating Python 3.12 environment (Python may be downloaded)", 0.05);
-    process::run(command(uv).args(["venv", "--python", "3.12"]).arg(environment.path()), cancel, Duration::from_secs(300), "Creating Python environment")?;
+    process::run(setup_command(uv, settings).args(["venv", "--python", "3.12"]).arg(environment.path()), cancel, Duration::from_secs(300), "Creating Python environment")?;
     let requirements = environment.path().join("requirements.txt");
     atomic_write(&requirements, REQUIREMENTS.as_bytes())?;
-    progress("Installing pyannote.audio and CPU dependencies", 0.2);
-    let mut install = command(uv);
+    progress("Installing pyannote.audio with automatic PyTorch backend selection", 0.2);
+    let mut install = setup_command(uv, settings);
     install.args(["pip", "install", "--python"]).arg(&python).arg("--requirements").arg(&requirements);
-    if !cfg!(target_os = "macos") { install.args(["--torch-backend", "cpu"]); }
+    if !cfg!(target_os = "macos") { install.args(["--torch-backend", "auto"]); }
     process::run(&mut install, cancel, Duration::from_secs(1800), "Installing speaker identification dependencies")?;
     progress("Validating Python and pyannote.audio", 0.9);
     let description = probe(&candidate, cancel)?;
     ensure!(!cancel.load(Ordering::Relaxed), "Setup cancelled");
-    atomic_write(&environment.path().join("ready.txt"), REQUIREMENTS.as_bytes())?;
+    atomic_write(&environment.path().join("ready.txt"), READY.as_bytes())?;
     let _ = environment.keep();
     progress("Speaker identification dependencies are ready", 1.0);
     Ok(SetupResult { interpreter: python, description })
@@ -168,8 +181,8 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "downloads Python/CPU pyannote dependencies; requires installed uv and internet access"]
-    fn real_cpu_environment_setup() {
+    #[ignore = "downloads Python/pyannote dependencies; requires installed uv and internet access"]
+    fn real_auto_environment_setup() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths { config: directory.path().join("config"), data: directory.path().join("data") };
         let settings = Settings::for_paths(&paths);
@@ -177,10 +190,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (uv, message) = find_uv(None, &cancel);
         let uv = uv.unwrap_or_else(|| panic!("{message}"));
-        let result = install(&paths, &settings, &uv, &cancel, |label, _| eprintln!("{label}")).unwrap();
+        let result = install(&settings, &uv, &cancel, |label, _| eprintln!("{label}")).unwrap();
         assert!(result.interpreter.is_file());
-        assert!(result.description.contains("CPU"));
-        let reused = install(&paths, &settings, &uv, &cancel, |_, _| {}).unwrap();
+        assert!(result.description.contains("CPU") || result.description.contains("CUDA"));
+        let reused = install(&settings, &uv, &cancel, |_, _| {}).unwrap();
         assert_eq!(reused.interpreter, result.interpreter);
     }
 
@@ -213,6 +226,8 @@ elif '--help' in args:
     print('{}')
 elif 'venv' in args:
     target = pathlib.Path(args[-1])
+    assert pathlib.Path(os.environ['UV_CACHE_DIR']) == target.parent.parent / 'cache'
+    assert pathlib.Path(os.environ['UV_PYTHON_INSTALL_DIR']) == target.parent.parent / 'python'
     (target / 'bin').mkdir(exist_ok=True)
     (target / 'bin' / 'python').symlink_to(sys.executable)
 elif 'install' in args:
@@ -228,35 +243,87 @@ elif 'install' in args:
 
     #[cfg(unix)]
     #[test]
-    fn managed_setup_embeds_requirements_uses_explicit_cpu_target_and_keeps_only_validated_environments() {
+    fn managed_setup_embeds_requirements_selects_backend_automatically_and_keeps_only_validated_environments() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths { config: directory.path().join("config"), data: directory.path().join("data with spaces") };
-        let settings = Settings::for_paths(&paths);
+        let settings = Settings { models_dir: directory.path().join("external models"), ..Settings::for_paths(&paths) };
         let original = settings.python_path.clone();
         let uv = fake_uv(directory.path(), false, true);
         let cancel = AtomicBool::new(false);
         assert!(validate_uv(&uv, &cancel).unwrap().starts_with("uv "));
-        let result = install_with_probe(&paths, &settings, &uv, &cancel, &mut |_, _| {}, |candidate, _| {
+        let result = install_with_probe(&settings, &uv, &cancel, &mut |_, _| {}, |candidate, _| {
             assert!(Path::new(&candidate.python_path).is_file());
             Ok("pyannote.audio test on Python 3.12 (CPU)".into())
         }).unwrap();
         assert!(result.interpreter.is_file());
+        assert!(result.interpreter.starts_with(settings.models_dir.join("diarization/envs")));
+        assert!(!paths.data.join("diarization").exists());
         assert_eq!(settings.python_path, original);
-        let environments: Vec<_> = fs::read_dir(environment_root(&paths)).unwrap().collect();
+        let environments: Vec<_> = fs::read_dir(environment_root(&settings)).unwrap().collect();
         assert_eq!(environments.len(), 1);
         let commands = fs::read_to_string(uv.with_file_name("uv with spaces.log")).unwrap();
         assert!(commands.contains("3.12"));
         assert!(commands.contains("--python"));
-        if !cfg!(target_os = "macos") { assert!(commands.contains("--torch-backend") && commands.contains("cpu")); }
+        if !cfg!(target_os = "macos") { assert!(commands.contains("--torch-backend") && commands.contains("\"auto\"")); }
         let detection = detect_with_probe(&paths, &settings, Some(&uv), &cancel, |candidate, _| {
             if candidate.python_path == original { anyhow::bail!("missing dependencies") } else { Ok("ready".into()) }
         });
         assert!(detection.dependencies.is_err());
         assert_eq!(detection.managed_python, Some(result.interpreter.clone()));
-        let failed = install_with_probe(&paths, &settings, &uv, &cancel, &mut |_, _| {}, |_, _| anyhow::bail!("probe failed"));
+        let failed = install_with_probe(&settings, &uv, &cancel, &mut |_, _| {}, |_, _| anyhow::bail!("probe failed"));
         assert!(failed.is_err());
-        assert_eq!(fs::read_dir(environment_root(&paths)).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(environment_root(&settings)).unwrap().count(), 1);
         assert!(result.interpreter.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_setup_preserves_legacy_cpu_environments_and_reuses_new_environments() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths { config: directory.path().join("config"), data: directory.path().join("data") };
+        let settings = Settings::for_paths(&paths);
+        let legacy = environment_root(&settings).join("python312-cpu-old");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("ready.txt"), REQUIREMENTS).unwrap();
+        let uv = fake_uv(directory.path(), false, true);
+        let cancel = AtomicBool::new(false);
+        let result = install_with_probe(&settings, &uv, &cancel, &mut |_, _| {}, |candidate, _| {
+            assert_ne!(Path::new(&candidate.python_path), interpreter(&legacy));
+            Ok("CUDA environment ready".into())
+        }).unwrap();
+        assert_eq!(fs::read_dir(environment_root(&settings)).unwrap().count(), 2);
+        assert_eq!(fs::read_to_string(legacy.join("ready.txt")).unwrap(), REQUIREMENTS);
+        let log = uv.with_file_name("uv with spaces.log");
+        let commands = fs::read(&log).unwrap();
+        let reused = install_with_probe(&settings, &uv, &cancel, &mut |_, _| {}, |candidate, _| {
+            assert_eq!(Path::new(&candidate.python_path), result.interpreter);
+            Ok("CUDA environment ready".into())
+        }).unwrap();
+        assert_eq!(reused.interpreter, result.interpreter);
+        assert_eq!(fs::read(log).unwrap(), commands);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_prefers_configured_models_and_preserves_legacy_environments() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths { config: directory.path().join("config"), data: directory.path().join("data") };
+        let settings = Settings { models_dir: directory.path().join("external models"), ..Settings::for_paths(&paths) };
+        let configured = environment_root(&settings).join("current");
+        let legacy = paths.data.join("diarization/envs/old");
+        for environment in [&configured, &legacy] {
+            fs::create_dir_all(environment).unwrap();
+            fs::write(environment.join("ready.txt"), REQUIREMENTS).unwrap();
+        }
+        let uv = fake_uv(directory.path(), false, true);
+        let detect = || detect_with_probe(&paths, &settings, Some(&uv), &AtomicBool::new(false), |candidate, _| {
+            ensure!(candidate.python_path != settings.python_path, "selected interpreter unavailable");
+            Ok("ready".into())
+        });
+        assert_eq!(detect().managed_python, Some(interpreter(&configured)));
+        fs::remove_file(configured.join("ready.txt")).unwrap();
+        assert_eq!(detect().managed_python, Some(interpreter(&legacy)));
+        assert_eq!(fs::read_to_string(legacy.join("ready.txt")).unwrap(), REQUIREMENTS);
     }
 
     #[cfg(unix)]
@@ -267,15 +334,15 @@ elif 'install' in args:
         let settings = Settings::for_paths(&paths);
         let uv = fake_uv(directory.path(), true, true);
         let cancel = AtomicBool::new(false);
-        let error = install_with_probe(&paths, &settings, &uv, &cancel, &mut |_, _| {}, |_, _| unreachable!()).unwrap_err();
+        let error = install_with_probe(&settings, &uv, &cancel, &mut |_, _| {}, |_, _| unreachable!()).unwrap_err();
         assert!(error.to_string().contains("simulated install failure"));
-        assert_eq!(fs::read_dir(environment_root(&paths)).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(environment_root(&settings)).unwrap().count(), 0);
         let uv = fake_uv(directory.path(), false, true);
-        let result = install_with_probe(&paths, &settings, &uv, &cancel, &mut |_, fraction| {
+        let result = install_with_probe(&settings, &uv, &cancel, &mut |_, fraction| {
             if fraction >= 0.2 { cancel.store(true, Ordering::Relaxed); }
         }, |_, _| unreachable!());
         assert!(result.unwrap_err().to_string().contains("cancelled"));
-        assert_eq!(fs::read_dir(environment_root(&paths)).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(environment_root(&settings)).unwrap().count(), 0);
         let uv = fake_uv(directory.path(), false, false);
         let result = validate_uv(&uv, &AtomicBool::new(false));
         if !cfg!(target_os = "macos") { assert!(result.unwrap_err().to_string().contains("Update uv")); }

@@ -84,6 +84,11 @@ pub fn load(path: &Path) -> Result<Self> {
         }
         Ok(collect_speech(&probabilities, samples.len(), options))
     }
+
+    pub fn contains_speech(&mut self, samples: &[f32], threshold: f32) -> Result<bool> {
+        // Brief speech at a live window edge must still trigger recognition.
+        Ok(!self.segments(samples, VadOptions { threshold, minimum_speech: 0.0, ..Default::default() })?.is_empty())
+    }
 }
 
 pub fn collect_speech(probabilities: &[f32], total_samples: usize, options: VadOptions) -> Vec<Speech> {
@@ -151,6 +156,21 @@ pub fn merge_for_asr(segments: &[Speech], maximum: f64, total: f64) -> Vec<Speec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires .test-cache/silero_vad.onnx and jfk.wav"]
+    fn real_silero_live_gate_skips_silence_and_keeps_speech() {
+        let cache = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".test-cache");
+        let mut detector = Vad::load(&cache.join("silero_vad.onnx")).unwrap();
+        let speech = crate::audio::read_range(&cache.join("jfk.wav"), 0, 3 * SAMPLE_RATE as usize).unwrap();
+        let silence = vec![0.0; 15 * SAMPLE_RATE as usize];
+        assert!(!detector.contains_speech(&silence, 0.5).unwrap());
+        assert!(detector.contains_speech(&speech, 0.5).unwrap());
+        let mut context = speech;
+        context.extend_from_slice(&silence);
+        assert!(detector.contains_speech(&context, 0.5).unwrap(), "retained speech must still allow tail finalization");
+        assert!(!detector.contains_speech(&silence, 0.5).unwrap(), "previous speech must not keep silent windows active");
+    }
 
     #[test]
     fn speech_regions_merge_with_padding_and_minimum_lengths() {

@@ -719,11 +719,11 @@ impl App {
                     Ok(settings) => settings,
                     Err(error) => { self.set_notice(format!("{error:#}"), true); return Task::none(); }
                 };
-                if let (Some(resources), Some(uv)) = (self.resources.clone(), self.speaker_detection.as_ref().and_then(|detection| detection.uv.clone())) {
+                if let Some(uv) = self.speaker_detection.as_ref().and_then(|detection| detection.uv.clone()) {
                     let revision = self.speaker_revision;
                     self.speaker_job_revision = Some(revision);
                     self.start_job(JobKind::PythonSetup, "Setting up speaker identification", move |reporter| {
-                        let result = diarization_setup::install(&resources.paths, &settings, &uv, &reporter.cancel, |label, fraction| reporter.progress(label, fraction))?;
+                        let result = diarization_setup::install(&settings, &uv, &reporter.cancel, |label, fraction| reporter.progress(label, fraction))?;
                         reporter.speaker_setup(revision, result);
                         Ok("Dependencies ready. Save settings to use this interpreter.".into())
                     });

@@ -103,10 +103,12 @@ impl App {
                 row![secondary("Keep working", Message::DismissClose, !self.closing), action("Stop and close", Message::ConfirmClose, !self.closing)].spacing(12),
             ].spacing(20)
         } else if self.confirm_speaker_setup {
+            let mut settings = self.draft.settings.clone();
+            settings.models_dir = std::path::PathBuf::from(self.draft.models_dir.trim());
             column![
                 text("Set up speaker identification?").size(22),
-                muted("uv will create a separate Python 3.12 environment and download pyannote.audio and CPU dependencies. Downloads can be substantial. Your existing Python setup stays available."),
-                muted(format!("Environment storage: {}", self.resources.as_ref()?.paths.data.join("diarization/envs").display())),
+                muted("uv will create a separate Python 3.12 environment and install pyannote.audio, selecting CUDA-enabled PyTorch when supported by your NVIDIA driver, or CPU otherwise. Downloads can be substantial. Your existing Python setup stays available."),
+                muted(format!("Environment storage: {}", crate::diarization_setup::environment_root(&settings).display())),
                 muted("After validation, the interpreter will be selected in this draft. Save settings to use it. Model weights are downloaded separately."),
                 row![secondary("Cancel", Message::DismissSpeakerSetup, true), action("Download and set up", Message::ConfirmSpeakerSetup, !self.busy())].spacing(12),
             ].spacing(20)
@@ -412,17 +414,18 @@ impl App {
                 ].spacing(18);
                 if settings.model.is_parakeet() {
                     options = options
-                        .push(muted("Live updates target a 1-second interval, with 2 seconds of lookahead and up to 10 seconds of preceding audio. Muted words may change as you speak."))
-                        .push(muted("Parakeet detects the language automatically and includes word timings. No separate alignment or speech detector is needed."));
+                        .push(muted("Live updates target a 3-second interval to reduce CPU use, with 2 seconds of lookahead and up to 10 seconds of preceding audio. Muted words may change as you speak."))
+                        .push(muted("Parakeet detects the language automatically and includes word timings. Silero skips silent live windows and finds speech regions in saved audio."));
                 } else {
                     options = options
                         .push(self.field("Live interval (seconds)", Field::ChunkSeconds, "5 to 30"))
                         .push(muted(settings.model.speed_warning().unwrap_or_default()))
                         .push(self.field("Language", Field::Language, "Auto-detect, or en, ru, de..."))
-                        .push(self.toggle("Detect speech (Silero)", Toggle::Vad, settings.vad_enabled))
-                        .push(self.field("Speech threshold", Field::VadThreshold, "0.1 to 0.9"))
                         .push(self.toggle("Word timings (DTW)", Toggle::Alignment, settings.alignment_enabled));
                 }
+                options = options
+                    .push(self.toggle("Detect speech (Silero)", Toggle::Vad, settings.vad_enabled))
+                    .push(self.field("Speech threshold", Field::VadThreshold, "0.1 to 0.9"));
                 column![self.settings_section("Transcription", options)]
             }
             SettingsTab::Speakers => {
@@ -452,9 +455,10 @@ impl App {
                 }
                 column![self.settings_section("Speaker identification", setup.spacing(16)), divider(), self.settings_section("Speaker model", column![
                 self.field("Speaker model", Field::DiarizationModel, "pyannote/speaker-diarization-community-1"),
+                self.path_field("Models folder (including speaker weights)", Field::ModelsDir),
                 self.field("Hugging Face token", Field::HfToken, "Required for gated models"),
                 quiet("Open model conditions on Hugging Face", Message::OpenSpeakerModel, crate::diarization_setup::model_url(&settings.diarization_model).is_some()),
-                muted("Accept the model's conditions and enter an access token. Verification may download weights into your models folder."),
+                muted("Accept the model's conditions and enter an access token. Weights use huggingface/hub inside the models folder. Changing the folder does not move existing downloads."),
                 muted(match &self.speaker_model {
                     Some(Ok(message)) => message.as_str(),
                     Some(Err(_)) => "Model verification failed. See the error below and try again.",
@@ -462,7 +466,7 @@ impl App {
                 }),
                 secondary("Verify and download speaker model", Message::CheckSpeakerModel, !self.busy() && detection.is_some_and(|detection| detection.dependencies.is_ok())),
                 row![self.field("Minimum speakers", Field::MinSpeakers, "Auto"), self.field("Maximum speakers", Field::MaxSpeakers, "Auto")].spacing(20),
-                muted("Manual Python environments remain supported. Automatic setup installs CPU dependencies; GPU configuration is manual."),
+                muted("Speaker identification automatically uses CUDA when available in the selected Python environment, independently of transcription acceleration. For an older CPU-only setup, run Set up automatically again, then Save settings."),
             ].spacing(20))].spacing(28)
             }
             SettingsTab::Notes => column![self.settings_section("Notes", column![
