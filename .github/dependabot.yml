@@ -60,3 +60,7 @@ updates:
       - "Applone"
     commit-message:
       prefix: "ci(deps)"
+    groups:
+      github-actions-dependencies:
+        patterns:
+          - "*"
