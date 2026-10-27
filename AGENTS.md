@@ -108,19 +108,19 @@ Python worker tests check protocol validation and output compatibility with mock
 
 `.github/workflows/build.yml` builds Linux x64 in AlmaLinux 9, macOS ARM64, and Windows x64. Debug runs on branch pushes/PRs; Release runs on tags. The release tag must match `Cargo.toml`'s version, with an optional `v` prefix.
 
-Packaging consumes an existing build, requires the native target OS, and supports only the three targets listed in `scripts/package.py`. Example for a Linux target build:
+Packaging consumes an existing build, requires the native target OS, and supports only the three targets listed in `scripts/release.py`. Example for a Linux target build:
 
 ```sh
 cargo build --locked --release --target x86_64-unknown-linux-gnu --bin parakeetx
-python3 scripts/package.py --configuration Release --target x86_64-unknown-linux-gnu --verify
+python3 scripts/release.py package --configuration Release --target x86_64-unknown-linux-gnu --verify
 ```
 
 - A host build goes into `target/release`, whereas packaging defaults to `target/<target>/release`; supply `--build-dir target/release` when packaging a host build. Debug uses `--configuration Debug` and `debug` output directories.
-- `--installers` is allowed only for Release and adds DEB/RPM/Arch packages, an NSIS installer, or a DMG. Linux uses nFPM (`scripts/install-packaging-tools.py`); Windows requires NSIS. Tool versions are in `packaging/tools.json`. Output defaults to ignored `artifacts/`.
+- `--installers` is allowed only for Release and adds DEB/RPM/Arch packages, an NSIS installer, or a DMG. Linux uses nFPM (`scripts/release.py install-tools`); Windows requires NSIS. Tool versions are in `packaging/tools.json`. Output defaults to ignored `artifacts/`.
 - ONNX Runtime is a native dependency. Linux CI deliberately uses Microsoft's shared CPU runtime 1.24.4 with `ORT_LIB_LOCATION` and `ORT_PREFER_DYNAMIC_LINK=1`; the default ort-sys static distribution needs a newer ABI than AlmaLinux 9. Keep runtime libraries beside the executable: `build.rs` supplies `$ORIGIN`/`@executable_path` rpaths, and packaging dereferences library symlinks.
 - Linux installers enforce glibc 2.34 for strong imports; weak imports do not set the compatibility floor. Build distributable Linux installers in the CI-compatible environment. nFPM's license field is literal and checked against the Cargo manifest.
 - macOS packages use ad-hoc signing for local execution. Distribution signing/notarization is a separate concern, not implemented by the packaging script.
 - `--verify` extracts and smoke-tests archives with library-path overrides removed. Release CI also installs/runs/uninstalls Linux packages in four distribution containers, verifies all eight expected assets, and checks hashes before publishing.
-- Verify a prepared release with `python3 scripts/verify-release.py --artifacts artifacts --tag v0.1.0` (use the actual manifest version). Its tag-only mode is `--tag v0.1.0 --tag-only`.
+- Verify a prepared release with `python3 scripts/release.py verify --artifacts artifacts --tag v0.1.0` (use the actual manifest version). Its tag-only mode is `--tag v0.1.0 --tag-only`.
 
 Project licensing is GPL-3.0-only; asset-specific licenses are under `assets/fonts/` and `assets/icons/`.

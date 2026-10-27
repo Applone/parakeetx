@@ -72,7 +72,7 @@ jobs:
           if [ "$BUILD_CONFIGURATION" = Release ]; then
             package_options+=(--installers)
           fi
-          python scripts/package.py --configuration "$BUILD_CONFIGURATION" --target "$BUILD_TARGET" --verify "${package_options[@]}"
+          python scripts/release.py package --configuration "$BUILD_CONFIGURATION" --target "$BUILD_TARGET" --verify "${package_options[@]}"
       - name: Upload application
         uses: actions/upload-artifact@v7
         with:
@@ -83,7 +83,7 @@ jobs:
             artifacts/*.deb
             artifacts/*.rpm
             artifacts/*.pkg.tar.zst
-            artifacts/*-setup.exe
+            artifacts/*.exe
             artifacts/*.dmg
             artifacts/*.sha256
           if-no-files-found: error

@@ -82,7 +82,7 @@ runs:
       if: runner.os == 'Linux' && inputs.configuration == 'Release'
       shell: bash
       run: |
-        python scripts/install-packaging-tools.py
+        python scripts/release.py install-tools
     - name: Install NSIS
       if: runner.os == 'Windows' && inputs.configuration == 'Release'
       shell: pwsh

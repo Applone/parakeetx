@@ -9,6 +9,18 @@ A local-first desktop app for recording microphone and system audio, transcribin
 
 Parakeet live transcription schedules overlapping windows every three seconds to reduce repeated inference, retaining up to ten seconds of preceding context. Recent words appear muted until they pass a two-second lookahead boundary; stopping the recording triggers final processing without waiting for the next interval. ONNX inference workers sleep when idle to avoid wasting CPU on thread spinning. Actual latency depends on inference speed. The CPU threads setting controls inference parallelism; fewer threads can reduce peak CPU use but may increase latency. Whisper uses the configurable live interval in Settings.
 
+## Downloads
+
+Download a package from the [latest release](https://github.com/Applone/parakeetx/releases/latest). Filenames start with the operating system, package type, and architecture, followed by the version:
+
+| System | Portable archive | Installer packages |
+| --- | --- | --- |
+| Linux x64 | `linux-portable-x64` (`.tar.gz`) | `linux-deb-x64`, `linux-rpm-x64`, `linux-arch-x64` |
+| Windows x64 | `windows-portable-x64` (`.zip`) | `windows-setup-x64` (`.exe`) |
+| macOS Apple Silicon | `macos-portable-arm64` (`.zip`) | `macos-installer-arm64` (`.dmg`) |
+
+For example, `parakeetx-linux-deb-x64-1.1.0.deb` is the Debian/Ubuntu package. Release filenames omit the build configuration; CI debug archives add `-debug` after the version. Each download has a matching `.sha256` file, and `checksums.txt` lists all package hashes.
+
 ## Build and run
 
 Requires Rust 1.88 or newer and native build tools, including CMake and Clang. Linux also needs PulseAudio, D-Bus, X11, Wayland, and libxkbcommon development libraries; see [.github/actions/setup/action.yml](.github/actions/setup/action.yml) for the dependency list. macOS builds require Xcode Command Line Tools; native system-audio capture requires macOS 13 or newer and recording permission.
@@ -39,6 +51,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
 Rust tests require `python3` on Unix or `python` on Windows. Packaging scripts require Python 3.11 or newer; CI uses 3.12. See [AGENTS.md](AGENTS.md) for architecture, native packaging, and tests requiring audio devices or model fixtures.
+
+`python3 scripts/release.py` groups packaging tasks into three subcommands: `package` packages an existing native Cargo build (add `--verify` to smoke-test it), `install-tools` installs the pinned nFPM binary, and `verify` checks release assets and writes `checksums.txt` (or validates just the tag with `--tag-only`). Each subcommand has `--help`. Check the Python release tooling with `uv tool run ruff check scripts` and `uv tool run ruff format --check scripts`.
 
 To exercise real automatic speaker setup, run `cargo test --locked --lib real_auto_environment_setup -- --ignored`. This requires installed uv and internet access and downloads Python/PyTorch dependencies; ordinary tests use fake installers and mocked model loading.
 

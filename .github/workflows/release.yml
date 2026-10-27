@@ -16,7 +16,7 @@ jobs:
       - name: Check tag matches application version
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: python3 scripts/verify-release.py --tag "$RELEASE_TAG" --tag-only
+        run: python3 scripts/release.py verify --tag "$RELEASE_TAG" --tag-only
   build:
     needs: validate-tag
     uses: ./.github/workflows/build.yml
@@ -77,7 +77,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python3 scripts/verify-release.py --artifacts artifacts --tag "$RELEASE_TAG"
+          python3 scripts/release.py verify --artifacts artifacts --tag "$RELEASE_TAG"
           cd artifacts
           sha256sum --check checksums.txt
       - name: Publish release and attach packages
