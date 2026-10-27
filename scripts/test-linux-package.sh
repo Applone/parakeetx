@@ -26,7 +26,15 @@ case "$PACKAGE_FORMAT" in
     pacman -Syu --noconfirm
     # Override the base image's documentation exclusion for this package only.
     printf '\n[options]\nNoExtract = !usr/share/doc/parakeetx !usr/share/doc/parakeetx/*\n' >> /etc/pacman.conf
-    pacman -U --noconfirm "${packages[0]}"
+    install_log=$(mktemp)
+    # Reinstallation also checks directories created by the first install.
+    for _ in 1 2; do
+      LC_ALL=C pacman -U --noconfirm "${packages[0]}" 2>&1 | tee -a "$install_log"
+    done
+    if grep -Fq 'directory permissions differ' "$install_log"; then
+      echo 'Arch package contains incompatible directory modes' >&2
+      exit 1
+    fi
     ;;
   *) echo "Unknown package format: $PACKAGE_FORMAT" >&2; exit 1 ;;
 esac

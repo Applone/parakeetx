@@ -56,6 +56,18 @@ overrides:
       - python3.12
       - ffmpeg
   archlinux:
+    # nFPM 2.47 tree expansion leaks Go's ModeDir bit into tar headers and
+    # .MTREE. Implicit parent directories use POSIX modes without that flag.
+    contents:
+      - src: ${PACKAGE_ROOT}/usr/lib/parakeetx/
+        dst: /usr/lib/parakeetx
+        expand: true
+      - src: /usr/lib/parakeetx/parakeetx
+        dst: /usr/bin/parakeetx
+        type: symlink
+      - src: ${PACKAGE_ROOT}/usr/share/
+        dst: /usr/share
+        expand: true
     depends:
       - glibc>=2.34
       - gcc-libs
