@@ -3,7 +3,7 @@ mod views;
 #[cfg(test)]
 mod tests;
 
-use std::{path::PathBuf, time::Duration};
+use std::{collections::VecDeque, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use iced::{Subscription, Task, widget::text_editor};
@@ -174,6 +174,9 @@ pub enum Message {
     PickImport,
     ImportPicked(Option<PathBuf>),
     RunTranscription,
+    RunDiarization,
+    CancelProcessing,
+    ClearQueue,
     RequestSummary,
     ConfirmSummary,
     DismissSummary,
@@ -255,6 +258,8 @@ pub struct App {
     transcript_filter: String,
     export_format: ExportFormat,
     job: Option<Job>,
+    processing: Option<Processing>,
+    queue: VecDeque<QueuedJob>,
     progress: f32,
     progress_label: String,
     notice: Option<(String, bool)>,
@@ -277,6 +282,22 @@ pub struct App {
     uv_override: Option<PathBuf>,
     confirm_speaker_setup: bool,
     width: f32,
+}
+
+struct QueuedJob {
+    kind: JobKind,
+    recording_id: Option<String>,
+    title: String,
+    work: Box<dyn FnOnce(engine::Reporter) -> Result<String> + Send>,
+}
+
+struct Processing {
+    job: Job,
+    recording_id: Option<String>,
+    title: String,
+    label: String,
+    progress: f32,
+    cancelling: bool,
 }
 
 pub fn run() -> iced::Result {
@@ -307,7 +328,7 @@ impl App {
             items: Vec::new(), search: String::new(), requested_id: None, selected: None, live: None, live_provisional: Vec::new(),
             recording_title: String::new(), detail_title: String::new(), recording_prompt: text_editor::Content::new(),
             detail_tab: DetailTab::Transcript, transcript_filter: String::new(), export_format: ExportFormat::Markdown,
-            job: None, progress: 0.0, progress_label: String::new(), notice: None,
+            job: None, processing: None, queue: VecDeque::new(), progress: 0.0, progress_label: String::new(), notice: None,
             paused: false, stopping: false, audio_saved: false, elapsed: 0.0, microphone_level: 0.0, system_level: 0.0,
             confirm_summary: false, confirm_remove: false, close_window: None, closing: false, saving: false, dialog_open: false,
             width: 1280.0,
@@ -327,7 +348,23 @@ impl App {
 
     fn theme(&self) -> iced::Theme { style::theme(self.draft.settings.appearance) }
 
-    fn busy(&self) -> bool { self.job.is_some() || self.saving || self.dialog_open }
+    fn busy(&self) -> bool { !self.can_record() || self.processing.is_some() || !self.queue.is_empty() }
+
+    fn can_record(&self) -> bool { self.job.is_none() && !self.saving && !self.dialog_open && !self.closing }
+
+    fn can_process(&self) -> bool {
+        !self.saving && !self.dialog_open && !self.closing && self.job.as_ref().is_none_or(|job| job.kind == JobKind::Recording)
+    }
+
+    fn recording_busy(&self, id: &str) -> bool {
+        self.processing.as_ref().is_some_and(|active| active.recording_id.as_deref() == Some(id))
+            || self.queue.iter().any(|pending| pending.recording_id.as_deref() == Some(id))
+            || (self.job.as_ref().is_some_and(|job| job.kind == JobKind::Recording) && self.live.as_ref().is_some_and(|live| live.id == id))
+    }
+
+    fn can_edit_selected(&self) -> bool {
+        self.can_process() && self.selected.as_ref().is_some_and(|recording| !self.recording_busy(&recording.id))
+    }
 
     fn is_recording(&self) -> bool {
         self.job.as_ref().is_some_and(|job| job.kind == JobKind::Recording) && !self.audio_saved
@@ -342,6 +379,66 @@ impl App {
         self.progress = 0.0;
         self.progress_label = label.into();
         self.job = Some(Job::spawn(kind, task));
+    }
+
+    fn enqueue(&mut self, kind: JobKind, recording_id: Option<String>, title: String, work: impl FnOnce(engine::Reporter) -> Result<String> + Send + 'static) {
+        self.queue.push_back(QueuedJob { kind, recording_id, title, work: Box::new(work) });
+    }
+
+    fn start_next(&mut self) {
+        if self.processing.is_none() && !self.closing && let Some(pending) = self.queue.pop_front() {
+            self.processing = Some(Processing {
+                job: Job::spawn(pending.kind, pending.work), recording_id: pending.recording_id,
+                title: pending.title, label: "Preparing".into(), progress: 0.0, cancelling: false,
+            });
+        }
+    }
+
+    fn queue_diarization(&mut self, id: String, settings: Settings, secrets: Secrets) {
+        if self.closing || self.queue.iter().any(|pending| pending.kind == JobKind::Diarization && pending.recording_id.as_ref() == Some(&id))
+            || self.processing.as_ref().is_some_and(|active| active.job.kind == JobKind::Diarization && active.recording_id.as_ref() == Some(&id)) { return; }
+        let Some(resources) = self.resources.clone() else { return };
+        let title = self.selected.as_ref().filter(|recording| recording.id == id)
+            .or_else(|| self.live.as_ref().filter(|recording| recording.id == id))
+            .map(|recording| recording.title.clone()).unwrap_or_else(|| "Recording".into());
+        self.enqueue(JobKind::Diarization, Some(id.clone()), title, move |reporter| {
+            let recording = resources.library.get(&id)?;
+            engine::identify_speakers(recording, settings, secrets, resources.library, reporter)
+        });
+    }
+
+    fn poll_processing(&mut self) -> bool {
+        let Some(active) = &self.processing else { return false };
+        let events = active.job.events.try_iter().take(200).collect::<Vec<_>>();
+        let kind = active.job.kind;
+        let cancelled = active.job.cancel.load(std::sync::atomic::Ordering::Relaxed);
+        let mut changed = false;
+        let mut finished = false;
+        for event in events {
+            match event {
+                Event::Recording(recording) => {
+                    if self.live.as_ref().is_some_and(|live| live.id == recording.id) { self.live = Some((*recording).clone()); }
+                    if kind == JobKind::Import && (self.page == Page::Import || self.selected.is_none()) { self.show_recording(*recording); }
+                    else if self.selected.as_ref().is_some_and(|selected| selected.id == recording.id) { self.selected = Some(*recording); }
+                    changed = true;
+                }
+                Event::QueueDiarization { recording_id, settings, secrets } => if !cancelled {
+                    self.queue_diarization(recording_id, *settings, secrets);
+                },
+                Event::Progress { label, fraction } => if let Some(active) = &mut self.processing { active.label = label; active.progress = fraction; },
+                Event::Warning(warning) => self.set_notice(warning, true),
+                Event::Finished(result) => {
+                    finished = true;
+                    match result {
+                        Ok(message) => if !self.notice.as_ref().is_some_and(|(_, error)| *error) { self.set_notice(message, false); },
+                        Err(error) => self.set_notice(error, true),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if finished { self.processing.take(); changed = true; }
+        changed
     }
 
     fn reload_library(&self) -> Task<Message> {
@@ -410,6 +507,7 @@ impl App {
                 if page == Page::Settings && self.settings_tab == SettingsTab::Speakers && self.speaker_detection.is_none() { self.check_speakers(); }
             }
             Message::Tick => {
+                let mut changed = self.poll_processing();
                 let (events, kind) = match &self.job {
                     Some(job) => (job.events.try_iter().take(200).collect::<Vec<_>>(), job.kind),
                     None => (Vec::new(), JobKind::Import),
@@ -436,6 +534,9 @@ impl App {
                             }
                         }
                         Event::AudioSaved => { self.audio_saved = true; self.microphone_level = 0.0; self.system_level = 0.0; }
+                        Event::QueueDiarization { recording_id, settings, secrets } => if !self.job.as_ref().is_some_and(|job| job.cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+                            self.queue_diarization(recording_id, *settings, secrets);
+                        },
                         Event::Levels { duration, microphone, system } => {
                             self.elapsed = duration;
                             self.microphone_level = self.microphone_level * 0.35 + microphone * 0.65;
@@ -479,10 +580,15 @@ impl App {
                     self.audio_saved = false;
                     self.microphone_level = 0.0;
                     self.system_level = 0.0;
-                    if self.closing && let Some(window) = self.close_window { return iced::window::close(window); }
-                    return self.reload_library();
+                    changed = true;
                 }
-                if scroll { return iced::widget::operation::snap_to_end("live-transcript"); }
+                self.start_next();
+                if self.closing && self.job.is_none() && self.processing.is_none() && !self.saving && !self.dialog_open
+                    && let Some(window) = self.close_window { return iced::window::close(window); }
+                let mut tasks = Vec::new();
+                if changed { tasks.push(self.reload_library()); }
+                if scroll { tasks.push(iced::widget::operation::snap_to_end("live-transcript")); }
+                return Task::batch(tasks);
             }
             Message::Search(query) => { self.search = query; return self.reload_library(); }
             Message::SearchResults(query, result) => if query == self.search {
@@ -499,7 +605,7 @@ impl App {
                 match result { Ok(recording) => { self.show_recording(recording); self.detail_tab = DetailTab::Transcript; self.transcript_filter.clear(); }, Err(error) => self.set_notice(error, true) }
             },
             Message::RecordingTitle(title) => self.recording_title = title,
-            Message::Start if !self.busy() => {
+            Message::Start if self.can_record() => {
                 let Some(resources) = self.resources.clone() else { return Task::none() };
                 let saved = &resources.settings;
                 let draft = &self.draft.settings;
@@ -530,10 +636,16 @@ impl App {
                 self.stopping = true;
                 self.progress_label = if setup { "Cancelling setup and removing the incomplete environment" } else { "Stopping safely; keeping saved audio" }.into();
             }
+            Message::CancelProcessing => if let Some(active) = &mut self.processing {
+                active.job.cancel();
+                active.cancelling = true;
+                active.label = "Cancelling; keeping saved audio and transcript".into();
+            },
+            Message::ClearQueue => self.queue.clear(),
             Message::OpenLive => {
                 if let Some(recording) = self.live.clone() { self.show_recording(recording); self.page = Page::Library; return self.reload_library(); }
             }
-            Message::PickImport if !self.busy() => {
+            Message::PickImport if self.can_process() => {
                 self.dialog_open = true;
                 return Task::perform(async {
                     rfd::AsyncFileDialog::new().set_title("Import an audio or video recording")
@@ -543,38 +655,65 @@ impl App {
             }
             Message::ImportPicked(path) => {
                 self.dialog_open = false;
-                if let (Some(path), Some(resources)) = (path, self.resources.clone()) && self.job.is_none() {
-                    self.start_job(JobKind::Import, "Importing recording", move |reporter| engine::import(path, resources.settings, resources.library, reporter));
+                if let (Some(path), Some(resources)) = (path, self.resources.clone()) && self.can_process() {
+                    self.notice = None;
+                    let title = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    self.enqueue(JobKind::Import, None, title, move |reporter| engine::import(path, resources.settings, resources.library, reporter));
+                    self.start_next();
                 }
             }
-            Message::RunTranscription if !self.busy() => {
+            Message::RunTranscription if self.can_edit_selected() => {
                 if let (Some(recording), Some(resources)) = (self.selected.clone(), self.resources.clone()) {
+                    self.notice = None;
                     self.page = Page::Library;
                     self.detail_tab = DetailTab::Transcript;
-                    self.start_job(JobKind::Transcription, "Preparing transcription", move |reporter| engine::transcribe(recording, resources.settings, resources.secrets, resources.library, reporter));
+                    self.enqueue(JobKind::Transcription, Some(recording.id.clone()), recording.title, move |reporter| {
+                        let recording = resources.library.get(&recording.id)?;
+                        engine::transcribe(recording, resources.settings, resources.secrets, resources.library, reporter)
+                    });
+                    self.start_next();
                 }
             }
-            Message::RequestSummary if !self.busy() => self.confirm_summary = true,
+            Message::RunDiarization if self.can_edit_selected() => {
+                if let (Some(recording), Some(resources)) = (&self.selected, self.resources.clone()) && !recording.segments.is_empty() {
+                    self.notice = None;
+                    self.queue_diarization(recording.id.clone(), resources.settings, resources.secrets);
+                    self.start_next();
+                }
+            }
+            Message::RequestSummary if self.can_edit_selected() && self.selected.as_ref().is_some_and(|recording| !recording.segments.is_empty()) => self.confirm_summary = true,
             Message::DismissSummary => self.confirm_summary = false,
-            Message::ConfirmSummary if !self.busy() => {
+            Message::ConfirmSummary if self.can_edit_selected() && self.confirm_summary => {
                 self.confirm_summary = false;
                 if let (Some(mut recording), Some(resources)) = (self.selected.clone(), self.resources.clone()) {
+                    self.notice = None;
                     recording.summary_prompt = self.recording_prompt.text();
                     self.detail_tab = DetailTab::Notes;
-                    self.start_job(JobKind::Summary, "Generating notes", move |reporter| engine::summarize(recording, resources.settings, resources.secrets, resources.library, reporter));
+                    self.enqueue(JobKind::Summary, Some(recording.id.clone()), recording.title, move |reporter| {
+                        let mut current = resources.library.get(&recording.id)?;
+                        current.summary_prompt = recording.summary_prompt;
+                        engine::summarize(current, resources.settings, resources.secrets, resources.library, reporter)
+                    });
+                    self.start_next();
                 }
             }
             Message::Tab(tab) => self.detail_tab = tab,
             Message::TranscriptFilter(filter) => self.transcript_filter = filter,
             Message::DetailTitle(title) => self.detail_title = title,
             Message::RecordingPrompt(action) => self.recording_prompt.perform(action),
-            Message::SaveRecording if !self.busy() => {
+            Message::SaveRecording if self.can_edit_selected() => {
                 if let (Some(mut recording), Some(resources)) = (self.selected.clone(), self.resources.clone()) {
                     if self.detail_title.trim().is_empty() { self.set_notice("The recording needs a title.", true); return Task::none(); }
                     recording.title = self.detail_title.trim().into();
                     recording.summary_prompt = self.recording_prompt.text();
                     self.saving = true;
-                    return blocking(move || { resources.library.save(&recording)?; Ok(recording) }, Message::RecordingSaved);
+                    return blocking(move || {
+                        let mut current = resources.library.get(&recording.id)?;
+                        current.title = recording.title;
+                        current.summary_prompt = recording.summary_prompt;
+                        resources.library.save(&current)?;
+                        Ok(current)
+                    }, Message::RecordingSaved);
                 }
             }
             Message::RecordingSaved(result) => {
@@ -614,9 +753,9 @@ impl App {
                 return blocking(move || { open::that_detached(path)?; Ok("Recording folder opened.".into()) }, Message::Done);
             },
             Message::Done(result) => match result { Ok(message) => self.set_notice(message, false), Err(error) => self.set_notice(error, true) },
-            Message::RequestRemove if !self.busy() => self.confirm_remove = true,
+            Message::RequestRemove if self.can_edit_selected() => self.confirm_remove = true,
             Message::DismissRemove => self.confirm_remove = false,
-            Message::Remove if !self.busy() => {
+            Message::Remove if self.can_edit_selected() => {
                 self.confirm_remove = false;
                 if let (Some(recording), Some(resources)) = (self.selected.take(), self.resources.clone()) {
                     self.requested_id = None;
@@ -764,11 +903,12 @@ impl App {
             Message::ConfirmClose => {
                 self.closing = true;
                 self.live_provisional.clear();
+                self.queue.clear();
+                if let Some(active) = &mut self.processing { active.job.cancel(); active.cancelling = true; }
                 if let Some(job) = &self.job {
                     job.cancel();
                     self.progress_label = if job.kind == JobKind::Recording { "Saving audio before closing" } else { "Stopping the operation before closing" }.into();
                 }
-                else if let Some(window) = self.close_window { return iced::window::close(window); }
             }
             Message::Resize(width) => self.width = width,
             _ => {}

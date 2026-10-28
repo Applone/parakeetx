@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, atomic::{AtomicBool, Ordering}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -27,6 +27,7 @@ mod live;
 pub enum JobKind {
     Recording,
     Transcription,
+    Diarization,
     Import,
     Summary,
     Download,
@@ -40,6 +41,7 @@ pub enum Event {
     Recording(Box<Recording>),
     LiveTranscript { recording_id: String, provisional: Vec<Word> },
     AudioSaved,
+    QueueDiarization { recording_id: String, settings: Box<Settings>, secrets: Secrets },
     Levels { duration: f64, microphone: f32, system: f32 },
     Progress { label: String, fraction: f32 },
     Warning(String),
@@ -91,6 +93,12 @@ impl Reporter {
 
     pub fn live_transcript(&self, recording_id: &str, provisional: Vec<Word>) {
         let _ = self.sender.send(Event::LiveTranscript { recording_id: recording_id.into(), provisional });
+    }
+
+    pub(crate) fn queue_diarization(&self, recording: &Recording, settings: Settings, secrets: Secrets) {
+        if settings.diarization_enabled && !recording.segments.is_empty() && !self.cancel.load(Ordering::Relaxed) {
+            let _ = self.sender.send(Event::QueueDiarization { recording_id: recording.id.clone(), settings: Box::new(settings), secrets });
+        }
     }
 
     pub fn check_cancelled(&self) -> Result<()> {
@@ -225,7 +233,6 @@ pub fn transcribe(mut recording: Recording, settings: Settings, secrets: Secrets
         }
         recording.status = RecordingStatus::Ready;
         if !replacing_transcript { library.save(&recording)?; }
-        optional_diarization(&mut recording, audio_path, &settings, &secrets, &reporter)?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -241,6 +248,7 @@ pub fn transcribe(mut recording: Recording, settings: Settings, secrets: Secrets
     }
     library.save(&recording)?;
     reporter.recording(&recording);
+    reporter.queue_diarization(&recording, settings, secrets);
     Ok(if recording.segments.is_empty() { "Transcription complete. No speech was detected.".into() } else { "Transcription complete.".into() })
 }
 
@@ -273,23 +281,28 @@ fn append_transcript(recording: &mut Recording, transcript: Transcript) {
     asr::merge(&mut recording.segments, transcript.segments);
 }
 
-fn optional_diarization(recording: &mut Recording, audio_path: &Path, settings: &Settings, secrets: &Secrets, reporter: &Reporter) -> Result<()> {
-    if settings.diarization_enabled && !recording.segments.is_empty() {
+pub fn identify_speakers(mut recording: Recording, settings: Settings, secrets: Secrets, library: Library, reporter: Reporter) -> Result<String> {
+    ensure!(!recording.segments.is_empty(), "Transcribe this recording before identifying speakers");
+    let result = (|| -> Result<()> {
         reporter.check_cancelled()?;
+        let prepared = audio::PreparedAudio::open(&recording.audio_path, &reporter.cancel, |fraction| reporter.progress("Preparing saved audio", fraction))?;
         reporter.progress("Identifying speakers in the Python worker", 0.0);
-        match diarize::run(settings, &secrets.huggingface_token, audio_path, recording.duration, &reporter.cancel) {
-            Ok(turns) => {
-                diarize::assign(&mut recording.segments, &turns);
-                recording.segments = diarize::split_on_speaker_change(std::mem::take(&mut recording.segments));
-                recording.pipeline.diarization = true;
-            }
-            Err(error) => {
-                recording.error = Some(format!("Transcript saved, but speaker identification failed: {error:#}"));
-                reporter.warning(recording.error.clone().unwrap_or_default());
-            }
-        }
+        let turns = diarize::run(&settings, &secrets.huggingface_token, prepared.path(), recording.duration, &reporter.cancel)?;
+        reporter.check_cancelled()?;
+        diarize::assign(&mut recording.segments, &turns);
+        recording.segments = diarize::split_on_speaker_change(std::mem::take(&mut recording.segments));
+        recording.pipeline.diarization = true;
+        Ok(())
+    })();
+    if let Err(error) = &result {
+        recording.error = Some(format!("Transcript saved, but speaker identification failed: {error:#}"));
+    } else if recording.error.as_ref().is_some_and(|error| error.starts_with("Transcript saved, but speaker identification failed:")) {
+        recording.error = None;
     }
-    Ok(())
+    library.save(&recording)?;
+    reporter.recording(&recording);
+    result?;
+    Ok("Speaker identification complete.".into())
 }
 
 struct SourceBuffer {
@@ -553,9 +566,6 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     if reporter.cancel.load(Ordering::Relaxed) {
         recording.status = if recording.segments.is_empty() { RecordingStatus::Recorded } else { RecordingStatus::Partial };
         recording.error = Some("Processing stopped. The recorded audio was saved.".into());
-    } else {
-        let audio_path = recording.audio_path.clone();
-        optional_diarization(&mut recording, &audio_path, &settings, &secrets, &reporter)?;
     }
     if capture_error.is_none() { capture_error = error_receiver.try_recv().ok(); }
     if let Some(error) = capture_error {
@@ -568,6 +578,7 @@ pub fn record(title: String, settings: Settings, secrets: Secrets, library: Libr
     store_audio(&mut recording, &settings, &library, &reporter);
     reporter.recording(&recording);
     if let Some(error) = &recording.error { reporter.warning(error); }
+    reporter.queue_diarization(&recording, settings, secrets);
     Ok("Recording saved to your library.".into())
 }
 
@@ -639,6 +650,113 @@ fn collect_live(results: &Receiver<LiveResult>, recording: &mut Recording, libra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn speaker_recording(directory: &std::path::Path) -> Recording {
+        let mut recording = Recording::new("Speaker test".into(), directory);
+        let mut writer = hound::WavWriter::create(&recording.audio_path, audio::wave_spec()).unwrap();
+        audio::write_samples(&mut writer, &vec![0.0; SAMPLE_RATE as usize * 2]).unwrap();
+        writer.finalize().unwrap();
+        recording.duration = 2.0;
+        recording.status = RecordingStatus::Ready;
+        recording.summary = "Existing notes".into();
+        recording.summary_prompt = "Existing instructions".into();
+        recording.language = Some("en".into());
+        recording.pipeline = PipelineInfo { model: "original-asr".into(), word_timestamps: true, ..Default::default() };
+        recording.segments = vec![crate::domain::Segment {
+            start: 0.1, end: 1.8, text: "Hello world".into(), speaker: Some("Old speaker".into()),
+            words: vec![
+                Word { text: "Hello".into(), start: 0.1, end: 0.8, confidence: 0.9, speaker: Some("Old speaker".into()) },
+                Word { text: "world".into(), start: 1.1, end: 1.8, confidence: 0.8, speaker: Some("Old speaker".into()) },
+            ],
+        }];
+        recording
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn speaker_only_processing_preserves_transcription_and_notes_without_asr_models() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let library = Library::open(directory.path().join("library.db")).unwrap();
+        let mut recording = speaker_recording(directory.path());
+        recording.error = Some("Audio capture stopped: test device disconnected".into());
+        library.save(&recording).unwrap();
+        let executable = directory.path().join("fake-python");
+        std::fs::write(&executable, r#"#!/usr/bin/env python3
+import json,sys
+request = json.load(sys.stdin)
+assert request['audio'].endswith('.wav')
+print(json.dumps({'ok':True,'turns':[{'start':0,'end':1,'speaker':'A'},{'start':1,'end':2,'speaker':'B'}]}))
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Speaker-only processing is available even when automatic identification is disabled.
+        let settings = Settings { python_path: executable.to_string_lossy().into_owned(), models_dir: directory.path().join("models"), diarization_enabled: false, ..Default::default() };
+        assert!(!settings.model_path().exists());
+        let (sender, events) = unbounded();
+        let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+        identify_speakers(recording.clone(), settings.clone(), Secrets::default(), library.clone(), reporter).unwrap();
+        let saved = library.get(&recording.id).unwrap();
+        let before: Vec<_> = recording.segments.iter().flat_map(|segment| &segment.words).map(|word| (&word.text, word.start, word.end, word.confidence)).collect();
+        let after: Vec<_> = saved.segments.iter().flat_map(|segment| &segment.words).map(|word| (&word.text, word.start, word.end, word.confidence)).collect();
+        assert_eq!(before, after);
+        assert_eq!(saved.segments.len(), 2);
+        assert_eq!(saved.segments[0].speaker.as_deref(), Some("A"));
+        assert_eq!(saved.segments[1].speaker.as_deref(), Some("B"));
+        assert_eq!(saved.summary, recording.summary);
+        assert_eq!(saved.summary_prompt, recording.summary_prompt);
+        assert_eq!(saved.language, recording.language);
+        assert_eq!(saved.pipeline.model, recording.pipeline.model);
+        assert!(saved.pipeline.diarization);
+        assert_eq!(saved.error, recording.error);
+        assert!(events.try_iter().any(|event| matches!(event, Event::Recording(_))));
+        assert_eq!(library.search("Hello").unwrap().len(), 1);
+        let mut retry = saved;
+        retry.error = Some("Transcript saved, but speaker identification failed: previous attempt".into());
+        let (sender, _events) = unbounded();
+        let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+        identify_speakers(retry, settings, Secrets::default(), library.clone(), reporter).unwrap();
+        assert!(library.get(&recording.id).unwrap().error.is_none());
+    }
+
+    #[test]
+    fn failed_or_cancelled_speaker_processing_keeps_existing_text_notes_and_assignments() {
+        for cancelled in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let library = Library::open(directory.path().join("library.db")).unwrap();
+            let mut recording = speaker_recording(directory.path());
+            recording.pipeline.diarization = true;
+            library.save(&recording).unwrap();
+            let settings = Settings { python_path: directory.path().join("missing-python").to_string_lossy().into_owned(), models_dir: directory.path().join("models"), ..Default::default() };
+            let (sender, _events) = unbounded();
+            let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(cancelled)), capture: Control::new() };
+            assert!(identify_speakers(recording.clone(), settings, Secrets::default(), library.clone(), reporter).is_err());
+            let saved = library.get(&recording.id).unwrap();
+            assert_eq!(saved.segments, recording.segments);
+            assert_eq!(saved.summary, recording.summary);
+            assert_eq!(saved.summary_prompt, recording.summary_prompt);
+            assert_eq!(saved.status, RecordingStatus::Ready);
+            assert!(saved.pipeline.diarization && saved.error.is_some());
+            assert!(saved.audio_path.exists());
+        }
+    }
+
+    #[test]
+    fn automatic_speaker_work_is_deferred_only_for_nonempty_uncancelled_transcripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut recording = speaker_recording(directory.path());
+        let (sender, events) = unbounded();
+        let reporter = Reporter { sender, cancel: Arc::new(AtomicBool::new(false)), capture: Control::new() };
+        let settings = Settings { diarization_enabled: true, ..Default::default() };
+        reporter.queue_diarization(&recording, settings.clone(), Secrets::default());
+        assert!(matches!(events.recv().unwrap(), Event::QueueDiarization { recording_id, .. } if recording_id == recording.id));
+        reporter.cancel.store(true, Ordering::Relaxed);
+        reporter.queue_diarization(&recording, settings.clone(), Secrets::default());
+        reporter.cancel.store(false, Ordering::Relaxed);
+        reporter.queue_diarization(&recording, Settings { diarization_enabled: false, ..settings.clone() }, Secrets::default());
+        recording.segments.clear();
+        reporter.queue_diarization(&recording, settings, Secrets::default());
+        assert!(events.is_empty());
+    }
 
     #[test]
     fn imports_follow_audio_quality_and_saved_compressed_audio_can_be_prepared() {

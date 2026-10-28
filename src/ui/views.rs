@@ -1,4 +1,5 @@
 use iced::{Alignment, Element, Fill, Font, widget::{self, Column, Row, button, checkbox, column, container, opaque, pick_list, progress_bar, row, scrollable, stack, svg, text, text_editor, text_input}};
+use std::hash::{Hash, Hasher};
 
 use super::{App, DetailTab, Field, Message, Page, SettingsTab, Toggle, selected_label, style};
 use crate::{domain::{ExportFormat, Recording, TranscriptionModel, timestamp}, settings::Appearance};
@@ -55,6 +56,30 @@ fn quiet<'a>(caption: &'a str, message: Message, enabled: bool) -> widget::Butto
     button(text(caption).size(13)).padding([10, 12]).style(style::quiet).on_press_maybe(enabled.then_some(message))
 }
 
+fn processing_name(kind: crate::engine::JobKind) -> &'static str {
+    match kind {
+        crate::engine::JobKind::Diarization => "Identify speakers",
+        crate::engine::JobKind::Transcription => "Transcribe",
+        crate::engine::JobKind::Summary => "Generate notes",
+        _ => "Import",
+    }
+}
+
+pub(super) fn transcript_text<'a>(content: impl Into<std::borrow::Cow<'a, str>>, provisional: bool) -> Element<'a, Message> {
+    let content = content.into();
+    let mut hasher = std::hash::DefaultHasher::new();
+    content.hash(&mut hasher);
+    provisional.hash(&mut hasher);
+    let key = hasher.finish();
+    // tiny-skia damages paragraph metrics, which can exclude glyph overhangs.
+    // An invisible, content-dependent background invalidates the padded row too.
+    let marker = iced::Color::from_rgba((key >> 32) as u32 as f32 / u32::MAX as f32, key as u32 as f32 / u32::MAX as f32, 0.0, 0.0);
+    let body = text(content).size(16).line_height(1.5);
+    let body = if provisional { body.style(style::muted) } else { body };
+    container(body)
+        .padding([2, 4]).width(Fill).style(move |_| widget::container::Style::default().background(marker)).into()
+}
+
 impl App {
     pub(super) fn view(&self) -> Element<'_, Message> {
         if let Some(error) = &self.fatal {
@@ -76,6 +101,22 @@ impl App {
                 row![label(&self.progress_label).width(Fill), quiet(if self.stopping { "Stopping..." } else { "Cancel" }, Message::Cancel, !self.stopping)].align_y(Alignment::Center).spacing(12),
                 progress_bar(0.0..=1.0, self.progress).girth(3).style(style::meter),
             ].spacing(8)).padding([10, 16]).style(style::surface));
+        }
+        if let Some(active) = &self.processing {
+            main = main.push(container(column![
+                row![label(format!("{} · {}", processing_name(active.job.kind), active.title)).width(Fill),
+                    quiet(if active.cancelling { "Cancelling..." } else { "Cancel task" }, Message::CancelProcessing, !active.cancelling && !self.closing),
+                ].spacing(12).align_y(Alignment::Center),
+                muted(&active.label),
+                progress_bar(0.0..=1.0, active.progress).girth(3).style(style::meter),
+            ].spacing(8)).padding([10, 16]).style(style::surface));
+        }
+        if !self.queue.is_empty() {
+            let mut pending = column![row![label(format!("{} queued", self.queue.len())).width(Fill), quiet("Clear queue", Message::ClearQueue, !self.closing)].align_y(Alignment::Center)].spacing(6);
+            for (index, job) in self.queue.iter().enumerate() {
+                pending = pending.push(muted(format!("{}. {} · {}", index + 1, processing_name(job.kind), job.title)));
+            }
+            main = main.push(container(scroll(pending).height(100)).padding([8, 16]).style(style::surface));
         }
         if let Some((message, error)) = &self.notice {
             main = main.push(container(row![
@@ -99,7 +140,7 @@ impl App {
         let content = if self.close_window.is_some() {
             column![
                 text(if self.closing { "Saving audio..." } else { "Stop and close?" }).size(22),
-                muted("Closing stops the active operation. Saved audio and completed transcript segments are kept."),
+                muted("Closing stops recording and background processing and clears the queue. Saved audio and completed transcript segments are kept."),
                 row![secondary("Keep working", Message::DismissClose, !self.closing), action("Stop and close", Message::ConfirmClose, !self.closing)].spacing(12),
             ].spacing(20)
         } else if self.confirm_speaker_setup {
@@ -116,7 +157,7 @@ impl App {
             column![
                 text("Remove recording?").size(22),
                 muted("The audio file stays on disk. The transcript and notes will be deleted."),
-                row![secondary("Cancel", Message::DismissRemove, true), action("Remove", Message::Remove, !self.busy()).style(style::record)].spacing(12),
+                row![secondary("Cancel", Message::DismissRemove, true), action("Remove", Message::Remove, self.can_edit_selected()).style(style::record)].spacing(12),
             ].spacing(20)
         } else if self.confirm_summary && self.page == Page::Library {
             let endpoint = &self.resources.as_ref()?.settings.summary_base_url;
@@ -124,7 +165,7 @@ impl App {
                 text("Send transcript for notes?").size(22),
                 muted(format!("Destination: {}", if endpoint.is_empty() { "Not configured" } else { endpoint })),
                 muted("Only transcript text is sent, not audio. Remote services may store requests; local endpoints process on this device."),
-                row![secondary("Cancel", Message::DismissSummary, true), action("Generate notes", Message::ConfirmSummary, !self.busy())].spacing(12),
+                row![secondary("Cancel", Message::DismissSummary, true), action("Generate notes", Message::ConfirmSummary, self.can_edit_selected())].spacing(12),
             ].spacing(20)
         } else {
             return None;
@@ -200,7 +241,7 @@ impl App {
             controls.push(button(row![
                 icon(Icon::Microphone, 18).style(|theme, _| svg::Style { color: Some(style::tokens(theme).canvas) }),
                 label("Start recording"),
-            ].spacing(10).align_y(Alignment::Center)).padding([12, 18]).style(style::record).on_press_maybe((!self.busy()).then_some(Message::Start))).into()
+            ].spacing(10).align_y(Alignment::Center)).padding([12, 18]).style(style::record).on_press_maybe(self.can_record().then_some(Message::Start))).into()
         };
         column![heading("Record"), transcript, sources, divider(), controls].spacing(24).height(Fill).into()
     }
@@ -219,14 +260,14 @@ impl App {
             text("Import audio or video").size(22),
             muted("MP3, MP4, M4A, WAV, FLAC, OGG, AAC, AIFF, MKV"),
             vspace(4.0),
-            action(if self.dialog_open { "Choosing..." } else { "Choose file" }, Message::PickImport, !self.busy()),
+            action(if self.dialog_open { "Choosing..." } else { "Choose file" }, Message::PickImport, self.can_process()),
         ].spacing(18).align_x(Alignment::Center);
         let mut content = column![container(picker).padding(40).center_x(Fill)].spacing(24).max_width(660);
         if let Some(recording) = &self.selected && recording.original_path.is_some() {
             content = content.push(container(column![
                 label(&recording.title),
                 muted(format!("{}  ·  {}", timestamp(recording.duration), recording.status)),
-                row![action("Transcribe", Message::RunTranscription, !self.busy()), secondary("View recording", Message::Navigate(Page::Library), true)].spacing(12),
+                row![action("Transcribe", Message::RunTranscription, self.can_edit_selected()), secondary("View recording", Message::Navigate(Page::Library), true)].spacing(12),
             ].spacing(12)).padding(24).width(Fill).style(style::surface));
         }
         column![heading("Import"), container(scroll(content)).center_x(Fill).center_y(Fill)].spacing(24).height(Fill).into()
@@ -266,9 +307,13 @@ impl App {
 
     fn detail_view<'a>(&'a self, recording: &'a Recording) -> Element<'a, Message> {
         let title = column![label("Title"), text_input("Recording title", &self.detail_title).on_input(Message::DetailTitle).size(17).padding(10).style(style::field)].spacing(6).width(Fill);
-        let title = row![title, quiet("Save", Message::SaveRecording, !self.busy())].spacing(8).align_y(Alignment::End);
+        let title = row![title, quiet("Save", Message::SaveRecording, self.can_edit_selected())].spacing(8).align_y(Alignment::End);
         let info = row![muted(timestamp(recording.duration)), muted(recording.language.as_deref().unwrap_or("Auto language")), spacer(), muted(recording.status.to_string())].spacing(12);
-        let controls = row![action("Transcribe", Message::RunTranscription, !self.busy()), secondary("Play audio", Message::OpenAudio, true)].spacing(10);
+        let controls = row![
+            action("Transcribe", Message::RunTranscription, self.can_edit_selected()),
+            secondary("Identify speakers", Message::RunDiarization, self.can_edit_selected() && !recording.segments.is_empty()),
+            secondary("Play audio", Message::OpenAudio, true),
+        ].spacing(10).wrap();
         let mut tabs = Row::new().spacing(4);
         for (tab, name) in [(DetailTab::Transcript, "Transcript"), (DetailTab::Words, "Word timings"), (DetailTab::Notes, "Notes")] {
             let active = tab == self.detail_tab;
@@ -286,7 +331,7 @@ impl App {
             pick_list(ExportFormat::ALL, Some(self.export_format), Message::ExportFormat).padding(9).text_size(12).style(style::select).menu_style(style::menu),
             quiet("Export", Message::Export, !self.dialog_open),
             spacer(),
-            quiet("Remove", Message::RequestRemove, !self.busy()),
+            quiet("Remove", Message::RequestRemove, self.can_edit_selected()),
         ].spacing(6).align_y(Alignment::Center);
         container(column![title, info, controls, tabs, divider(), body, divider(), export].spacing(12).height(Fill))
             .padding(20).width(Fill).height(Fill).style(style::surface).into()
@@ -308,14 +353,14 @@ impl App {
                 muted(timestamp(segment.start)).font(Font::MONOSPACE).size(12),
                 text(segment.speaker.as_deref().unwrap_or("")).size(12).style(style::accent),
             ].spacing(14);
-            rows = rows.push(column![header, text(&segment.text).size(16).line_height(1.5)].spacing(8));
+            rows = rows.push(column![container(header).padding([0, 4]), transcript_text(segment.text.as_str(), false)].spacing(6));
         }
         if let Some(first) = provisional.first() {
             let hypothesis = provisional.iter().map(|word| word.text.as_str()).collect::<Vec<_>>().join(" ");
             rows = rows.push(column![
-                muted(timestamp(first.start)).font(Font::MONOSPACE).size(12),
-                text(hypothesis).size(16).line_height(1.5).style(style::muted),
-            ].spacing(8));
+                container(muted(timestamp(first.start)).font(Font::MONOSPACE).size(12)).padding([0, 4]),
+                transcript_text(hypothesis, true),
+            ].spacing(6));
         }
         let scroll = scroll(rows.padding([4, 0])).id(id).height(Fill);
         if filtering {
@@ -344,7 +389,7 @@ impl App {
     fn notes_view<'a>(&'a self, recording: &'a Recording) -> Element<'a, Message> {
         let prompt = text_editor(&self.recording_prompt).placeholder("Use the default prompt, or add instructions.").on_action(Message::RecordingPrompt).height(100).padding(12).size(13).style(style::editor);
         let mut notes = column![label("Instructions (optional)"), prompt, row![
-            action("Generate notes", Message::RequestSummary, !self.busy() && !recording.segments.is_empty()),
+            action("Generate notes", Message::RequestSummary, self.can_edit_selected() && !recording.segments.is_empty()),
             quiet("Copy notes", Message::CopyNotes, !recording.summary.is_empty()),
         ].spacing(10)].spacing(14);
         if recording.summary.is_empty() {

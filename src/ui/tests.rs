@@ -275,3 +275,222 @@ fn cancelling_a_job_discards_provisional_text_and_whisper_settings_survive_model
     assert_eq!(app.draft.build().unwrap().chunk_seconds, 9);
     let _ = app.view();
 }
+
+fn tick_until(app: &mut App, done: impl Fn(&App) -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !done(app) {
+        assert!(std::time::Instant::now() < deadline, "background work did not finish");
+        let _ = app.update(Message::Tick);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn processing_is_fifo_and_recording_controls_remain_independent() {
+    let (mut app, _directory) = app();
+    let (release, wait) = crossbeam_channel::bounded(1);
+    let (started, order) = crossbeam_channel::unbounded();
+    let first = started.clone();
+    app.enqueue(JobKind::Diarization, Some("first".into()), "First".into(), move |_| {
+        first.send(1).unwrap();
+        wait.recv().unwrap();
+        anyhow::bail!("speaker test failure")
+    });
+    app.enqueue(JobKind::Transcription, Some("second".into()), "Second".into(), move |_| {
+        started.send(2).unwrap();
+        Ok("second finished".into())
+    });
+    app.start_next();
+    assert_eq!(order.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+    assert!(order.is_empty());
+    assert!(app.can_record());
+    assert!(app.recording_busy("first") && app.recording_busy("second"));
+    assert!(!app.recording_busy("other"));
+    app.start_job(JobKind::Recording, "Recording", move |reporter| {
+        while !reporter.capture.is_stopped() { std::thread::sleep(Duration::from_millis(5)); }
+        Ok("recording saved".into())
+    });
+    assert!(app.is_recording());
+    assert!(app.can_process());
+    let _ = app.update(Message::Pause);
+    assert!(app.paused);
+    app.page = Page::Library;
+    let _ = app.view();
+    release.send(()).unwrap();
+    tick_until(&mut app, |app| app.processing.is_none() && app.queue.is_empty());
+    assert_eq!(order.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+    assert!(app.is_recording() && app.paused);
+    assert!(app.notice.as_ref().unwrap().0.contains("speaker test failure"));
+    let _ = app.update(Message::Finish);
+    tick_until(&mut app, |app| app.job.is_none());
+}
+
+#[test]
+fn cancelling_processing_and_clearing_pending_work_preserves_foreground_capture() {
+    let (mut app, _directory) = app();
+    app.enqueue(JobKind::Diarization, Some("active".into()), "Active".into(), move |reporter| {
+        while !reporter.cancel.load(std::sync::atomic::Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(5)); }
+        reporter.check_cancelled()?;
+        Ok("done".into())
+    });
+    let (started, ran) = crossbeam_channel::unbounded();
+    app.enqueue(JobKind::Diarization, Some("pending".into()), "Pending".into(), move |_| { started.send(()).unwrap(); Ok("done".into()) });
+    app.start_next();
+    let _ = app.update(Message::ClearQueue);
+    assert!(!app.recording_busy("pending"));
+    let _ = app.update(Message::CancelProcessing);
+    assert!(app.processing.as_ref().unwrap().cancelling);
+    tick_until(&mut app, |app| app.processing.is_none());
+    assert!(ran.is_empty());
+    assert!(app.can_record());
+}
+
+#[test]
+fn queued_entries_cannot_be_changed_or_queued_twice_and_results_do_not_change_selection() {
+    let (mut app, _directory) = app();
+    let library = app.resources.as_ref().unwrap().library.clone();
+    let first = Recording::new("First".into(), _directory.path());
+    let second = Recording::new("Second".into(), _directory.path());
+    library.save(&first).unwrap();
+    library.save(&second).unwrap();
+    app.show_recording(first.clone());
+    let (release, wait) = crossbeam_channel::bounded(1);
+    let first_id = first.id.clone();
+    app.enqueue(JobKind::Diarization, Some(first_id), first.title.clone(), move |reporter| {
+        wait.recv().unwrap();
+        reporter.recording(&first);
+        Ok("done".into())
+    });
+    app.start_next();
+    assert!(!app.can_edit_selected());
+    for message in [Message::RunDiarization, Message::RunTranscription, Message::SaveRecording, Message::RequestRemove, Message::Remove] {
+        let _ = app.update(message);
+    }
+    assert!(app.queue.is_empty() && !app.confirm_remove && !app.saving);
+    app.show_recording(second.clone());
+    app.detail_title = "Unsaved title".into();
+    assert!(app.can_edit_selected());
+    release.send(()).unwrap();
+    tick_until(&mut app, |app| app.processing.is_none());
+    assert_eq!(app.selected.as_ref().unwrap().id, second.id);
+    assert_eq!(app.detail_title, "Unsaved title");
+}
+
+#[test]
+fn closing_cancels_both_workers_and_discards_pending_work() {
+    let (mut app, _directory) = app();
+    app.start_job(JobKind::Recording, "Recording", move |reporter| {
+        while !reporter.capture.is_stopped() { std::thread::sleep(Duration::from_millis(5)); }
+        Ok("saved".into())
+    });
+    app.enqueue(JobKind::Diarization, Some("active".into()), "Active".into(), move |reporter| {
+        while !reporter.cancel.load(std::sync::atomic::Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(5)); }
+        reporter.check_cancelled()?;
+        Ok("done".into())
+    });
+    app.start_next();
+    app.enqueue(JobKind::Diarization, Some("pending".into()), "Pending".into(), |_| panic!("pending work must not start"));
+    let _ = app.update(Message::Close(iced::window::Id::unique()));
+    assert!(app.close_window.is_some());
+    let _ = app.update(Message::ConfirmClose);
+    assert!(app.queue.is_empty() && app.closing);
+    assert!(app.job.as_ref().unwrap().cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(app.processing.as_ref().unwrap().job.cancel.load(std::sync::atomic::Ordering::Relaxed));
+    tick_until(&mut app, |app| app.job.is_none() && app.processing.is_none());
+}
+
+fn saved_transcript(app: &App, directory: &std::path::Path) -> Recording {
+    let mut recording = Recording::new("Existing transcript".into(), directory);
+    let mut writer = hound::WavWriter::create(&recording.audio_path, crate::audio::wave_spec()).unwrap();
+    crate::audio::write_samples(&mut writer, &vec![0.0; crate::SAMPLE_RATE as usize]).unwrap();
+    writer.finalize().unwrap();
+    recording.duration = 1.0;
+    recording.status = crate::domain::RecordingStatus::Ready;
+    recording.segments = vec![crate::domain::Segment { start: 0.0, end: 1.0, text: "Saved transcript".into(), words: Vec::new(), speaker: None }];
+    app.resources.as_ref().unwrap().library.save(&recording).unwrap();
+    recording
+}
+
+#[test]
+fn manual_speaker_action_loads_current_metadata_and_does_not_require_retranscription() {
+    let (mut app, directory) = app();
+    let mut recording = saved_transcript(&app, directory.path());
+    app.show_recording(recording.clone());
+    recording.summary = "Latest notes from the library".into();
+    app.resources.as_ref().unwrap().library.save(&recording).unwrap();
+    let resources = app.resources.as_mut().unwrap();
+    resources.settings.python_path = directory.path().join("missing-python").to_string_lossy().into_owned();
+    resources.settings.diarization_enabled = false;
+    assert!(!resources.settings.model_path().exists());
+    let _ = app.update(Message::RunDiarization);
+    assert_eq!(app.processing.as_ref().unwrap().job.kind, JobKind::Diarization);
+    assert!(app.can_record());
+    let _ = app.update(Message::RunDiarization);
+    assert!(app.queue.is_empty());
+    tick_until(&mut app, |app| app.processing.is_none());
+    let saved = app.resources.as_ref().unwrap().library.get(&recording.id).unwrap();
+    assert_eq!(saved.summary, recording.summary);
+    assert_eq!(saved.segments, recording.segments);
+    assert!(saved.error.unwrap().contains("Python"));
+    assert_eq!(app.selected.as_ref().unwrap().summary, recording.summary);
+}
+
+#[test]
+fn recording_completion_hands_speakers_to_the_queue_and_releases_the_recording_slot() {
+    let (mut app, directory) = app();
+    let recording = saved_transcript(&app, directory.path());
+    let settings = Settings { diarization_enabled: true, python_path: directory.path().join("missing-python").to_string_lossy().into_owned(), ..app.resources.as_ref().unwrap().settings.clone() };
+    app.start_job(JobKind::Recording, "Recording", move |reporter| {
+        reporter.recording(&recording);
+        reporter.queue_diarization(&recording, settings, Secrets::default());
+        Ok("saved".into())
+    });
+    while !app.job.as_ref().unwrap().is_finished() { std::thread::sleep(Duration::from_millis(5)); }
+    let _ = app.update(Message::Tick);
+    assert!(app.job.is_none() && app.can_record());
+    assert_eq!(app.processing.as_ref().unwrap().job.kind, JobKind::Diarization);
+    assert!(app.live.is_some());
+    tick_until(&mut app, |app| app.processing.is_none());
+    assert_eq!(app.live.as_ref().unwrap().segments[0].text, "Saved transcript");
+}
+
+#[test]
+fn transcript_partial_redraw_matches_a_clean_frame_after_text_changes_and_scrolling() {
+    use iced::{Color, Font, Point, Rectangle, Size, Vector, advanced::{Layout, Renderer, graphics::{Viewport, damage, text::font_system}, layout, mouse, renderer, widget::Tree}};
+
+    font_system().write().unwrap().load_font(std::borrow::Cow::Borrowed(include_bytes!("../../assets/fonts/FiraSans-Regular.ttf")));
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let viewport = Viewport::with_physical_size(Size::new(640, 360), scale);
+        let bounds = Rectangle::with_size(viewport.logical_size());
+        let mut renderer = iced::Renderer::new(Font::with_name("Fira Sans"), 16.0.into());
+        let mut incremental = tiny_skia::Pixmap::new(640, 360).unwrap();
+        let mut mask = tiny_skia::Mask::new(640, 360).unwrap();
+        let mut previous = Vec::new();
+        for (index, (content, offset)) in [
+            ("То есть, когда у нас дробь в", 0.0),
+            ("Больше 0, но меньше единицы.", 0.0),
+            ("То есть, когда у нас дробь в", 13.25),
+            ("First line wraps across the available width. То есть, когда у нас дробь в", 27.5),
+            ("Больше 0, но меньше единицы.", 4.75),
+        ].into_iter().enumerate() {
+            renderer.reset(bounds);
+            let mut element = views::transcript_text(content, index % 2 == 0);
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(230.0, 300.0)))
+                .move_to(Point::new(40.25, 45.5));
+            renderer.with_layer(bounds, |renderer| renderer.with_translation(Vector::new(0.0, -offset), |renderer| {
+                element.as_widget().draw(&tree, renderer, &iced::Theme::Dark, &renderer::Style { text_color: Color::WHITE }, Layout::new(&node), mouse::Cursor::Unavailable, &bounds);
+            }));
+            let layers = renderer.layers().to_vec();
+            let dirty = if index == 0 { vec![bounds] } else {
+                damage::group(damage::diff(&previous, &layers, |layer| vec![layer.bounds], iced_tiny_skia::Layer::damage), bounds)
+            };
+            renderer.draw(&mut incremental.as_mut(), &mut mask, &viewport, &dirty, Color::BLACK);
+            let mut clean = tiny_skia::Pixmap::new(640, 360).unwrap();
+            renderer.draw(&mut clean.as_mut(), &mut mask, &viewport, &[bounds], Color::BLACK);
+            let mismatches = incremental.data().iter().zip(clean.data()).filter(|(a, b)| a != b).count();
+            assert_eq!(mismatches, 0, "stale glyph pixels at scale {scale}, frame {index}");
+            previous = layers;
+        }
+    }
+}
