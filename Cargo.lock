@@ -2000,7 +2000,7 @@ dependencies = [
  "resvg",
  "rustc-hash 2.1.3",
  "softbuffer",
- "tiny-skia 0.11.4",
+ "tiny-skia",
 ]
 
 [[package]]
@@ -3369,7 +3369,7 @@ dependencies = [
  "sha2 0.11.1",
  "symphonia",
  "tempfile",
- "tiny-skia 0.12.0",
+ "tiny-skia",
  "tokio",
  "uuid",
  "whisper-rs",
@@ -3491,19 +3491,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
 dependencies = [
  "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide 0.8.9",
-]
-
-[[package]]
-name = "png"
-version = "0.18.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
-dependencies = [
- "bitflags 2.13.2",
  "crc32fast",
  "fdeflate",
  "flate2",
@@ -3902,7 +3889,7 @@ dependencies = [
  "pico-args",
  "rgb",
  "svgtypes",
- "tiny-skia 0.11.4",
+ "tiny-skia",
  "usvg",
  "zune-jpeg",
 ]
@@ -4205,7 +4192,7 @@ dependencies = [
  "log",
  "memmap2",
  "smithay-client-toolkit 0.19.2",
- "tiny-skia 0.11.4",
+ "tiny-skia",
 ]
 
 [[package]]
@@ -4997,23 +4984,8 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "png 0.17.16",
- "tiny-skia-path 0.11.4",
-]
-
-[[package]]
-name = "tiny-skia"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
-dependencies = [
- "arrayref",
- "arrayvec",
- "bytemuck",
- "cfg-if",
- "log",
- "png 0.18.1",
- "tiny-skia-path 0.12.0",
+ "png",
+ "tiny-skia-path",
 ]
 
 [[package]]
@@ -5021,17 +4993,6 @@ name = "tiny-skia-path"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
-dependencies = [
- "arrayref",
- "bytemuck",
- "strict-num",
-]
-
-[[package]]
-name = "tiny-skia-path"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -5415,7 +5376,7 @@ dependencies = [
  "siphasher",
  "strict-num",
  "svgtypes",
- "tiny-skia-path 0.11.4",
+ "tiny-skia-path",
  "unicode-bidi",
  "unicode-script",
  "unicode-vo",
