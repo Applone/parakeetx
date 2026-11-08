@@ -167,18 +167,34 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
         let marker = directory.path().join("descendant-survived");
-        let mut command = python("import pathlib,subprocess,sys,time;subprocess.Popen([sys.executable,'-c',\"import pathlib,sys,time;time.sleep(0.6);pathlib.Path(sys.argv[1]).write_text('alive')\",sys.argv[2]]);pathlib.Path(sys.argv[1]).write_text('ready');time.sleep(60)");
-        command.arg(&ready).arg(&marker);
+        let release = directory.path().join("release");
+        // Signal readiness from the descendant itself, then let the test decide
+        // when it may write. Python startup can be slow on busy Windows runners.
+        let mut command = python(r#"
+import subprocess, sys, time
+subprocess.Popen([sys.executable, '-I', '-c', '''
+import pathlib, sys, time
+ready, release, marker = map(pathlib.Path, sys.argv[1:])
+ready.write_text('ready')
+while not release.exists():
+    time.sleep(0.01)
+marker.write_text('alive')
+''', *sys.argv[1:]])
+time.sleep(60)
+"#);
+        command.arg(&ready).arg(&release).arg(&marker);
         let cancel = AtomicBool::new(false);
         thread::scope(|scope| {
             scope.spawn(|| {
-                let deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = Instant::now() + Duration::from_secs(30);
                 while !ready.exists() && Instant::now() < deadline { thread::sleep(Duration::from_millis(10)); }
                 cancel.store(true, Ordering::Relaxed);
             });
-            assert!(run(&mut command, &cancel, Duration::from_secs(5), "Install").is_err());
+            let error = run(&mut command, &cancel, Duration::from_secs(60), "Install").unwrap_err();
+            assert!(error.to_string().contains("cancelled"), "{error:#}");
         });
         assert!(ready.exists(), "descendant must have started before cancellation");
+        std::fs::write(&release, "release").unwrap();
         thread::sleep(Duration::from_millis(700));
         assert!(!marker.exists(), "the descendant must not survive cancellation");
     }
