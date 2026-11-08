@@ -338,7 +338,8 @@ mod tests {
         let python = if cfg!(windows) { "python" } else { "python3" };
         let child = ManagedChild::spawn(Command::new(python).args(["-c", "import sys;sys.stderr.write('x'*200000);sys.stdout.write('{\"ok\":true,\"turns\":[]}\\n')"])
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())).unwrap();
-        let result = finish(child, None, &AtomicBool::new(false), Duration::from_secs(5)).unwrap();
+        // Include cold Python startup on busy CI runners in the deadlock budget.
+        let result = finish(child, None, &AtomicBool::new(false), Duration::from_secs(30)).unwrap();
         assert!(result.ok);
     }
 
