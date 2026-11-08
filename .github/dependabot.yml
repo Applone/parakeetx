@@ -22,6 +22,9 @@ updates:
         versions: [">=0.6.0"]
       - dependency-name: "cpal"
         versions: [">=0.18.0"]
+      # Rendering tests require the tiny-skia version used by iced_tiny_skia.
+      - dependency-name: "tiny-skia"
+        versions: [">=0.12.0"]
     groups:
       cargo-dependencies:
         patterns:
